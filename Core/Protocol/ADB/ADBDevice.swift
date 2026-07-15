@@ -1,30 +1,5 @@
 import Foundation
 
-/// 线程安全的 Continuation 包装器，确保只 resume 一次
-private final class ContinuationBox<T, E: Error>: @unchecked Sendable {
-    private var continuation: CheckedContinuation<T, E>?
-    private let lock = NSLock()
-    
-    init(_ continuation: CheckedContinuation<T, E>) {
-        self.continuation = continuation
-    }
-    
-    /// 只有第一次调用会生效，后续调用静默忽略
-    func resume(returning value: T) {
-        lock.lock()
-        defer { lock.unlock() }
-        continuation?.resume(returning: value)
-        continuation = nil
-    }
-    
-    func resume(throwing error: E) {
-        lock.lock()
-        defer { lock.unlock() }
-        continuation?.resume(throwing: error)
-        continuation = nil
-    }
-}
-
 /// ADB 协议实现 — 通过调用 adb 命令行工具与设备通信
 final class ADBDevice: DeviceProtocol {
     let name = "ADB Device"

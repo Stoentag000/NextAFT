@@ -25,6 +25,8 @@
 		F1470A2E2FB82A3400DFB83E /* TransferListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1470A1C2FB82A3400DFB83E /* TransferListView.swift */; };
 		F1470A2F2FB82A3400DFB83E /* FileRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1470A152FB82A3400DFB83E /* FileRow.swift */; };
 		F1470A302FB82A3400DFB83E /* USBDeviceDetector.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1470A0E2FB82A3400DFB83E /* USBDeviceDetector.swift */; };
+		F1F377683007455E0033D618 /* AFTLWrapper.cpp in Sources */ = {isa = PBXBuildFile; fileRef = F1F377663007455E0033D618 /* AFTLWrapper.cpp */; };
+		F1F3776B300745760033D618 /* ContinuationBox.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1F37769300745760033D618 /* ContinuationBox.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -48,6 +50,9 @@
 		F1470A1B2FB82A3400DFB83E /* FileBrowserView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileBrowserView.swift; sourceTree = "<group>"; };
 		F1470A1C2FB82A3400DFB83E /* TransferListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TransferListView.swift; sourceTree = "<group>"; };
 		F1B0FB1C2FB03E18005682CA /* NextAFT.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = NextAFT.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		F1F377653007455E0033D618 /* AFTLWrapper.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = AFTLWrapper.h; sourceTree = "<group>"; };
+		F1F377663007455E0033D618 /* AFTLWrapper.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = AFTLWrapper.cpp; sourceTree = "<group>"; };
+		F1F37769300745760033D618 /* ContinuationBox.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContinuationBox.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -84,6 +89,7 @@
 		F1470A092FB82A3400DFB83E /* MTP */ = {
 			isa = PBXGroup;
 			children = (
+				F1F377673007455E0033D618 /* AFTLBridge */,
 				F1470A082FB82A3400DFB83E /* MTPDevice.swift */,
 			);
 			path = MTP;
@@ -118,6 +124,7 @@
 		F1470A102FB82A3400DFB83E /* Core */ = {
 			isa = PBXGroup;
 			children = (
+				F1F3776A300745760033D618 /* Utils */,
 				F1470A052FB82A3400DFB83E /* Models */,
 				F1470A0B2FB82A3400DFB83E /* Protocol */,
 				F1470A0D2FB82A3400DFB83E /* Transfer */,
@@ -189,6 +196,23 @@
 				F1B0FB1C2FB03E18005682CA /* NextAFT.app */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		F1F377673007455E0033D618 /* AFTLBridge */ = {
+			isa = PBXGroup;
+			children = (
+				F1F377653007455E0033D618 /* AFTLWrapper.h */,
+				F1F377663007455E0033D618 /* AFTLWrapper.cpp */,
+			);
+			path = AFTLBridge;
+			sourceTree = "<group>";
+		};
+		F1F3776A300745760033D618 /* Utils */ = {
+			isa = PBXGroup;
+			children = (
+				F1F37769300745760033D618 /* ContinuationBox.swift */,
+			);
+			path = Utils;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -265,8 +289,10 @@
 			files = (
 				F1470A202FB82A3400DFB83E /* TransferTask.swift in Sources */,
 				F1470A212FB82A3400DFB83E /* RemoteFile.swift in Sources */,
+				F1F377683007455E0033D618 /* AFTLWrapper.cpp in Sources */,
 				F1470A222FB82A3400DFB83E /* FileBrowserViewModel.swift in Sources */,
 				F1470A232FB82A3400DFB83E /* ADBDevice.swift in Sources */,
+				F1F3776B300745760033D618 /* ContinuationBox.swift in Sources */,
 				F1470A242FB82A3400DFB83E /* NextAFTApp.swift in Sources */,
 				F1470A252FB82A3400DFB83E /* DeviceError.swift in Sources */,
 				F1470A262FB82A3400DFB83E /* ProtocolType.swift in Sources */,
@@ -420,12 +446,26 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = "$(SRCROOT)/Core/Protocol/MTP/AFTLBridge";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
+				LIBRARY_SEARCH_PATHS = "/Users/laohu/NextAFT/Vendor/aftl-output/lib";
 				MARKETING_VERSION = 1.0;
+				OTHER_CPLUSPLUSFLAGS = (
+					"$(OTHER_CFLAGS)",
+					"-isystem",
+					"$(SRCROOT)/Vendor/aftl",
+				);
+				OTHER_LDFLAGS = (
+					"-lmtp-ng-static",
+					"-framework",
+					IOKit,
+					"-framework",
+					CoreFoundation,
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.Stoentag000.NextAFT;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
@@ -433,6 +473,7 @@
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "NextAFT-Bridging.h";
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 			};
@@ -452,12 +493,26 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = "$(SRCROOT)/Core/Protocol/MTP/AFTLBridge";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
+				LIBRARY_SEARCH_PATHS = "/Users/laohu/NextAFT/Vendor/aftl-output/lib";
 				MARKETING_VERSION = 1.0;
+				OTHER_CPLUSPLUSFLAGS = (
+					"$(OTHER_CFLAGS)",
+					"-isystem",
+					"$(SRCROOT)/Vendor/aftl",
+				);
+				OTHER_LDFLAGS = (
+					"-lmtp-ng-static",
+					"-framework",
+					IOKit,
+					"-framework",
+					CoreFoundation,
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.Stoentag000.NextAFT;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
@@ -465,6 +520,7 @@
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "NextAFT-Bridging.h";
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 			};

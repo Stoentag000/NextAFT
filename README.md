@@ -18,12 +18,40 @@
 - macOS 14.0+
 - Xcode 26+
 - Swift 5.0+
+- CMake 3.10+ (`brew install cmake`)
 - ADB 模式需要安装 [Android SDK Platform Tools](https://developer.android.com/tools/releases/platform-tools)
 
 ## 构建
 
-1. 克隆项目
-2. 用 Xcode 打开 `NextAFT.xcodeproj`
+### 1. 克隆项目（含子模块）
+
+```bash
+git clone --recurse-submodules <repo-url>
+cd NextAFT
+```
+
+如果已经克隆但没有子模块：
+
+```bash
+git submodule update --init --recursive
+```
+
+### 2. 编译 AFTL（MTP 支持）
+
+```bash
+./build_aftl.sh
+```
+
+这会编译 android-file-transfer-linux 静态库，输出到 `Vendor/aftl-output/`。
+
+### 3. 用 Xcode 打开并构建
+
+1. 用 Xcode 打开 `NextAFT.xcodeproj`
+2. 在 Build Settings 中配置：
+   - **Header Search Paths**: `$(SRCROOT)/Vendor/aftl-output/include`
+   - **Library Search Paths**: `$(SRCROOT)/Vendor/aftl-output/lib`
+   - **Other Linker Flags**: `-lmtp-ng-static -framework IOKit -framework CoreFoundation`
+   - **Objective-C Bridging Header**: `NextAFT/NextAFT-Bridging.h`
 3. 选择目标设备 → Build & Run
 
 ADB 路径会自动按以下顺序查找：
@@ -38,7 +66,8 @@ ADB 路径会自动按以下顺序查找：
 ```
 NextAFT/
 ├── NextAFTApp.swift                    # App 入口
-├── NextAFT-Bridging.h                  # libmtp C 桥接头（预留）
+├── NextAFT-Bridging.h                  # Swift-C 桥接头（引入 AFTLWrapper.h）
+├── build_aftl.sh                       # AFTL 静态库编译脚本
 │
 ├── Core/                               # 核心业务逻辑
 │   ├── Models/                         # 数据模型
@@ -50,11 +79,17 @@ NextAFT/
 │   ├── Protocol/                       # 设备协议层
 │   │   ├── DeviceProtocol.swift        # 统一协议接口
 │   │   ├── ADB/ADBDevice.swift         # ADB 协议实现
-│   │   └── MTP/MTPDevice.swift         # MTP 协议实现（TODO）
+│   │   └── MTP/
+│   │       ├── MTPDevice.swift         # MTP 协议实现（Swift）
+│   │       └── AFTLBridge/
+│   │           ├── AFTLWrapper.h       # 纯 C 桥接接口
+│   │           └── AFTLWrapper.cpp     # C++ 实现（调用 AFTL 库）
 │   ├── Transfer/
 │   │   └── TransferManager.swift       # 传输队列管理
-│   └── USB/
-│       └── USBDeviceDetector.swift     # USB 设备检测（TODO）
+│   ├── USB/
+│   │   └── USBDeviceDetector.swift     # USB 设备检测（IOKit）
+│   └── Utils/
+│       └── ContinuationBox.swift       # 线程安全的 Continuation 包装
 │
 ├── UI/                                 # SwiftUI 视图层
 │   ├── Components/                     # 可复用 UI 组件
@@ -69,6 +104,10 @@ NextAFT/
 │
 ├── Resources/
 │   └── Info.plist
+│
+├── Vendor/                             # 第三方依赖（git submodule）
+│   ├── aftl/                           # android-file-transfer-linux 源码
+│   └── aftl-output/                    # 编译产物（.a + headers）
 │
 └── NextAFT.xcodeproj/
 ```
@@ -85,6 +124,18 @@ Models → Protocol(接口) → Devices(实现) → Services → ViewModel → V
 - `TransferManager` 管理传输队列，支持并发、进度、取消
 - `FileBrowserViewModel` 协调本地/远程文件操作与 UI 状态
 - 视图层纯 SwiftUI，`NavigationSplitView` 双面板
+
+### MTP 协议栈
+
+```
+Swift (MTPDevice.swift)
+  ↓ 调用纯 C 函数
+AFTLWrapper.h / .cpp   (C++ 桥接层)
+  ↓ 调用 C++ 类
+libmtp-ng-static.a     (android-file-transfer-linux 编译产物)
+  ↓ IOKit USB 通信
+Android 设备
+```
 
 ## 许可证
 

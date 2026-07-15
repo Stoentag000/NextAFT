@@ -30,3 +30,9 @@ xcuserdata/
 *.moved-aside
 *.xcuserstate
 *.xcscmblueprint
+
+# AFTL build output (headers + static lib copied by build_aftl.sh)
+Vendor/aftl-output/
+
+# AFTL submodule build directory
+Vendor/aftl/build/
