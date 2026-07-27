@@ -55,6 +55,83 @@ nonisolated private final class ADBProgressCallbackBox: @unchecked Sendable {
     }
 }
 
+/// Encodes commands sent through `adb shell` and decodes directory records.
+/// The record protocol is deliberately independent of `ls` output because
+/// Android vendors use different date formats and column layouts.
+enum ADBShellProtocol {
+    static func quote(_ value: String) -> String {
+        // POSIX shells cannot contain a single quote inside a single-quoted
+        // string. Close the quote, emit an escaped quote, then reopen it.
+        "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
+    }
+
+    static func directoryListingCommand(path: String) -> String {
+        """
+        directory=\(quote(path))
+        if [ ! -d "$directory" ]; then
+            printf '%s\\n' 'ADB directory does not exist' >&2
+            exit 1
+        fi
+        if [ ! -r "$directory" ]; then
+            printf '%s\\n' 'ADB directory is not readable' >&2
+            exit 1
+        fi
+        for entry in "$directory"/* "$directory"/.[!.]* "$directory"/..?*; do
+            if [ -e "$entry" ] || [ -L "$entry" ]; then
+                metadata=$(stat -c '%f %s %Y' -- "$entry") || exit 1
+                set -- $metadata
+                printf '%s\\000%s\\000%s\\000%s\\000' "$1" "$2" "$3" "${entry##*/}"
+            fi
+        done
+        """
+    }
+
+    static func parseDirectoryListing(
+        _ output: String,
+        parentPath: String
+    ) throws -> [RemoteFile] {
+        var fields = output.split(separator: "\0", omittingEmptySubsequences: false)
+        if fields.last?.isEmpty == true {
+            fields.removeLast()
+        }
+
+        guard fields.count.isMultiple(of: 4) else {
+            throw DeviceError.processError("adb 返回了无法识别的目录数据")
+        }
+
+        var files: [RemoteFile] = []
+        files.reserveCapacity(fields.count / 4)
+
+        for index in stride(from: 0, to: fields.count, by: 4) {
+            let modeText = String(fields[index])
+            let sizeText = String(fields[index + 1])
+            let modifiedText = String(fields[index + 2])
+            let name = String(fields[index + 3])
+
+            guard let mode = UInt32(modeText, radix: 16),
+                  let size = UInt64(sizeText),
+                  let modifiedSeconds = TimeInterval(modifiedText) else {
+                throw DeviceError.processError("adb 返回了无效的文件元数据")
+            }
+            guard name != ".", name != ".." else { continue }
+
+            let fullPath = parentPath.hasSuffix("/")
+                ? "\(parentPath)\(name)"
+                : "\(parentPath)/\(name)"
+            files.append(RemoteFile(
+                name: name,
+                path: fullPath,
+                size: size,
+                isDirectory: mode & 0xF000 == 0x4000,
+                modifiedDate: Date(timeIntervalSince1970: modifiedSeconds),
+                mimeType: nil
+            ))
+        }
+
+        return files
+    }
+}
+
 /// Owns one adb child process and drains stdout/stderr concurrently so neither
 /// pipe can fill up while a large directory listing or diagnostic is emitted.
 nonisolated private final class ADBProcessRunner: @unchecked Sendable {
@@ -230,14 +307,10 @@ final class ADBDevice: DeviceProtocol {
     
     func listFiles(at path: String) async throws -> [RemoteFile] {
         guard isConnected, let deviceId else { throw DeviceError.notConnected }
-        
-        // adb shell ls -la <path>
-        let output = try await runADB(["-s", deviceId, "shell", "ls -la \(path.shellEscaped)"])
-        let lines = output.split(separator: "\n")
-        
-        return lines.compactMap { line -> RemoteFile? in
-            parseLsLine(String(line), parentPath: path)
-        }
+
+        let command = ADBShellProtocol.directoryListingCommand(path: path)
+        let output = try await runADB(["-s", deviceId, "shell", command])
+        return try ADBShellProtocol.parseDirectoryListing(output, parentPath: path)
     }
     
     func download(from remotePath: String, to localURL: URL,
@@ -286,11 +359,11 @@ final class ADBDevice: DeviceProtocol {
             try cancellation.checkCancellation()
             _ = try await runADB([
                 "-s", deviceId, "shell",
-                "mv -f \(partialPath.shellEscaped) \(remotePath.shellEscaped)"
+                "mv -f -- \(ADBShellProtocol.quote(partialPath)) \(ADBShellProtocol.quote(remotePath))"
             ], cancellation: cancellation)
         } catch {
             _ = try? await runADB([
-                "-s", deviceId, "shell", "rm -f \(partialPath.shellEscaped)"
+                "-s", deviceId, "shell", "rm -f -- \(ADBShellProtocol.quote(partialPath))"
             ])
             throw error
         }
@@ -300,19 +373,27 @@ final class ADBDevice: DeviceProtocol {
         guard isConnected, let deviceId else { throw DeviceError.notConnected }
         
         // 先判断是文件还是目录
-        let statOutput = try await runADB(["-s", deviceId, "shell", "stat -c %F \(path.shellEscaped)"])
+        let statOutput = try await runADB([
+            "-s", deviceId, "shell", "stat -c %F -- \(ADBShellProtocol.quote(path))"
+        ])
         let isDir = statOutput.trimmingCharacters(in: .whitespacesAndNewlines).contains("directory")
         
         if isDir {
-            _ = try await runADB(["-s", deviceId, "shell", "rm -rf \(path.shellEscaped)"])
+            _ = try await runADB([
+                "-s", deviceId, "shell", "rm -rf -- \(ADBShellProtocol.quote(path))"
+            ])
         } else {
-            _ = try await runADB(["-s", deviceId, "shell", "rm \(path.shellEscaped)"])
+            _ = try await runADB([
+                "-s", deviceId, "shell", "rm -- \(ADBShellProtocol.quote(path))"
+            ])
         }
     }
     
     func createDirectory(at path: String) async throws {
         guard isConnected, let deviceId else { throw DeviceError.notConnected }
-        _ = try await runADB(["-s", deviceId, "shell", "mkdir -p \(path.shellEscaped)"])
+        _ = try await runADB([
+            "-s", deviceId, "shell", "mkdir -p -- \(ADBShellProtocol.quote(path))"
+        ])
     }
     
     func getDeviceInfo() async throws -> DeviceInfo {
@@ -418,76 +499,6 @@ final class ADBDevice: DeviceProtocol {
         return "adb 已退出，状态码：\(result.status)"
     }
     
-    // MARK: - ls -la 解析
-    
-    private func parseLsLine(_ line: String, parentPath: String) -> RemoteFile? {
-        // 跳过 total 行和空行
-        guard !line.hasPrefix("total"), !line.trimmingCharacters(in: .whitespaces).isEmpty else {
-            return nil
-        }
-        
-        let parts = line.split(separator: " ", omittingEmptySubsequences: true)
-        guard parts.count >= 7 else { return nil }
-        
-        // 解析权限字符串（第 0 列）
-        let permissions = String(parts[0])
-        let firstChar = permissions.prefix(1)
-        
-        // 必须是合法的权限格式: -, d, l, c, b, p, s
-        guard ["-", "d", "l", "c", "b", "p", "s"].contains(firstChar) else { return nil }
-        
-        let isDir = firstChar == "d"
-        
-        // 定位日期字段 — 月份是三个字母的英文缩写
-        let months: Set<String> = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                                    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-        var dateStartIndex: Int?
-        
-        for i in 2..<min(parts.count - 2, 8) {
-            if months.contains(String(parts[i])) && i + 1 < parts.count {
-                // 验证下一个字段是数字（日期）
-                let dayStr = String(parts[i + 1])
-                if Int(dayStr) != nil {
-                    dateStartIndex = i
-                    break
-                }
-            }
-        }
-        
-        guard let dateIdx = dateStartIndex, dateIdx + 3 < parts.count else { return nil }
-        
-        // 日期格式: month day year_or_time → 文件名从 dateIdx+3 开始
-        let nameStartIdx = dateIdx + 3
-        guard nameStartIdx < parts.count else { return nil }
-        
-        let name = parts[nameStartIdx...].joined(separator: " ")
-        
-        // 跳过 . 和 ..
-        guard name != ".", name != ".." else { return nil }
-        
-        // 解析文件大小（第 4 列，在 link count / owner / group 之后）
-        // 有些 Android ls 输出可能有 owner+group 或只有 owner
-        // 保守处理：取 dateIdx 之前的字段中最像数字的
-        var size: UInt64 = 0
-        for i in stride(from: dateIdx - 1, through: 1, by: -1) {
-            if let s = UInt64(parts[i]) {
-                size = s
-                break
-            }
-        }
-        
-        let fullPath = parentPath.hasSuffix("/") ? "\(parentPath)\(name)" : "\(parentPath)/\(name)"
-        
-        return RemoteFile(
-            name: name,
-            path: fullPath,
-            size: size,
-            isDirectory: isDir,
-            modifiedDate: nil,
-            mimeType: nil
-        )
-    }
-    
     // MARK: - ADB 查找
     
     nonisolated static func findADB() -> URL? {
@@ -538,18 +549,5 @@ final class ADBDevice: DeviceProtocol {
         let url = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
         guard FileManager.default.isExecutableFile(atPath: url.path) else { return nil }
         return url
-    }
-}
-
-// MARK: - String Extension
-
-private extension String {
-    var shellEscaped: String {
-        let specialChars = CharacterSet(charactersIn: " \"'\\(){}[]|&;*?<>~!#$")
-        if unicodeScalars.contains(where: { specialChars.contains($0) }) {
-            let escaped = replacingOccurrences(of: "'", with: "'\\''")
-            return "'\(escaped)'"
-        }
-        return self
     }
 }
