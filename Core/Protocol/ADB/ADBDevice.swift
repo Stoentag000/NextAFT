@@ -1,5 +1,173 @@
 import Foundation
 
+nonisolated private struct ADBProcessResult: Sendable {
+    let status: Int32
+    let standardOutput: String
+    let standardError: String
+}
+
+nonisolated private enum ADBProcessExit: Sendable {
+    case exited(Int32)
+    case timedOut
+}
+
+/// Process.terminationHandler can run before or after wait() is installed.
+/// This small latch handles both orders and resumes the continuation once.
+nonisolated private final class ADBProcessExitLatch: @unchecked Sendable {
+    private let lock = NSLock()
+    private var result: ADBProcessExit?
+    private var continuation: CheckedContinuation<ADBProcessExit, Never>?
+
+    func wait() async -> ADBProcessExit {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if let result {
+                lock.unlock()
+                continuation.resume(returning: result)
+            } else {
+                self.continuation = continuation
+                lock.unlock()
+            }
+        }
+    }
+
+    @discardableResult
+    func finish(_ result: ADBProcessExit) -> Bool {
+        lock.lock()
+        guard self.result == nil else {
+            lock.unlock()
+            return false
+        }
+        self.result = result
+        let continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume(returning: result)
+        return true
+    }
+}
+
+nonisolated private final class ADBProgressCallbackBox: @unchecked Sendable {
+    let callback: (Double) -> Void
+
+    init(_ callback: @escaping (Double) -> Void) {
+        self.callback = callback
+    }
+}
+
+/// Owns one adb child process and drains stdout/stderr concurrently so neither
+/// pipe can fill up while a large directory listing or diagnostic is emitted.
+nonisolated private final class ADBProcessRunner: @unchecked Sendable {
+    private let process = Process()
+    private let outputPipe = Pipe()
+    private let errorPipe = Pipe()
+    private let progressBox: ADBProgressCallbackBox?
+
+    init(executableURL: URL, arguments: [String],
+         progress: ((Double) -> Void)? = nil) {
+        process.executableURL = executableURL
+        process.arguments = arguments
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = outputPipe
+        process.standardError = errorPipe
+        progressBox = progress.map(ADBProgressCallbackBox.init)
+    }
+
+    func run(timeout: TimeInterval?,
+             cancellation: TransferCancellationToken? = nil) async throws -> ADBProcessResult {
+        try cancellation?.checkCancellation()
+        let exitLatch = ADBProcessExitLatch()
+        process.terminationHandler = { process in
+            exitLatch.finish(.exited(process.terminationStatus))
+        }
+
+        try process.run()
+
+        let cancellationRegistration = cancellation?.register { [weak self] in
+            if self?.process.isRunning == true {
+                self?.process.terminate()
+            }
+        }
+        defer { cancellation?.unregister(cancellationRegistration) }
+
+        let outputHandle = outputPipe.fileHandleForReading
+        let errorHandle = errorPipe.fileHandleForReading
+        let outputTask = Task.detached {
+            Self.drain(outputHandle)
+        }
+        let errorTask = Task.detached { [progressBox] in
+            Self.drain(errorHandle) { data in
+                guard let progressBox,
+                      let text = String(data: data, encoding: .utf8) else { return }
+                for value in Self.progressValues(in: text) {
+                    Task { @MainActor in
+                        progressBox.callback(value)
+                    }
+                }
+            }
+        }
+
+        var timeoutWorkItem: DispatchWorkItem?
+        if let timeout {
+            let workItem = DispatchWorkItem { [weak self] in
+                guard exitLatch.finish(.timedOut) else { return }
+                if self?.process.isRunning == true {
+                    self?.process.terminate()
+                }
+            }
+            timeoutWorkItem = workItem
+            DispatchQueue.global(qos: .utility).asyncAfter(
+                deadline: .now() + timeout,
+                execute: workItem
+            )
+        }
+
+        let exit = await exitLatch.wait()
+        timeoutWorkItem?.cancel()
+
+        switch exit {
+        case .timedOut:
+            throw DeviceError.processError("adb 命令超时（\(Int(timeout ?? 0)) 秒）")
+        case .exited(let status):
+            let outputData = await outputTask.value
+            let errorData = await errorTask.value
+            return ADBProcessResult(
+                status: status,
+                standardOutput: String(data: outputData, encoding: .utf8) ?? "",
+                standardError: String(data: errorData, encoding: .utf8) ?? ""
+            )
+        }
+    }
+
+    private static func drain(
+        _ handle: FileHandle,
+        onChunk: ((Data) -> Void)? = nil
+    ) -> Data {
+        var collected = Data()
+        while true {
+            do {
+                guard let chunk = try handle.read(upToCount: 16 * 1024),
+                      !chunk.isEmpty else { break }
+                collected.append(chunk)
+                onChunk?(chunk)
+            } catch {
+                break
+            }
+        }
+        return collected
+    }
+
+    private static func progressValues(in text: String) -> [Double] {
+        text.components(separatedBy: "%]").compactMap { component in
+            guard let bracketIndex = component.lastIndex(of: "[") else { return nil }
+            let numberStart = component.index(after: bracketIndex)
+            let number = component[numberStart...].trimmingCharacters(in: .whitespaces)
+            guard let percent = Double(number) else { return nil }
+            return min(max(percent / 100.0, 0), 1)
+        }
+    }
+}
+
 /// ADB 协议实现 — 通过调用 adb 命令行工具与设备通信
 final class ADBDevice: DeviceProtocol {
     let name = "ADB Device"
@@ -7,36 +175,49 @@ final class ADBDevice: DeviceProtocol {
     private(set) var isConnected = false
     
     private var deviceId: String?
-    private let adbPath: String
+    private let adbURL: URL?
     
     init(adbPath: String? = nil) {
-        // 优先使用传入路径，否则从 app bundle 或 PATH 查找
-        self.adbPath = adbPath ?? ADBDevice.findADB()
+        // 优先使用传入路径，否则从 app bundle、SDK 变量、常见路径和 PATH 查找。
+        if let adbPath {
+            adbURL = ADBDevice.executableURL(at: adbPath)
+        } else {
+            adbURL = ADBDevice.findADB()
+        }
     }
     
     // MARK: - Connection
     
     func connect() async throws {
         // 检测 adb 是否可用
-        let version = try await runADB(["version"])
+        let version = try await runADB(["version"], timeout: 10)
         guard version.contains("Android Debug Bridge") else {
             throw DeviceError.adbNotFound
         }
+
+        // 显式启动 server，便于把端口占用、权限等启动错误直接反馈给界面。
+        _ = try await runADB(["start-server"], timeout: 15)
         
         // 获取已连接设备列表
-        let output = try await runADB(["devices"])
+        let output = try await runADB(["devices"], timeout: 15)
         let lines = output.split(separator: "\n").dropFirst()
-        let devices = lines.compactMap { line -> String? in
+        let deviceStates = lines.compactMap { line -> (id: String, state: String)? in
             let parts = line.split(separator: "\t")
-            guard parts.count >= 2, parts[1] == "device" else { return nil }
-            return String(parts[0])
+            guard parts.count >= 2 else { return nil }
+            return (String(parts[0]), String(parts[1]))
         }
         
-        guard let firstDevice = devices.first else {
+        guard let firstDevice = deviceStates.first(where: { $0.state == "device" }) else {
+            if let blockedDevice = deviceStates.first {
+                let hint = blockedDevice.state == "unauthorized"
+                    ? "请解锁手机并允许此 Mac 的 USB 调试授权"
+                    : "设备状态为 \(blockedDevice.state)，请重新连接后重试"
+                throw DeviceError.connectionFailed(hint)
+            }
             throw DeviceError.noDeviceFound
         }
         
-        deviceId = firstDevice
+        deviceId = firstDevice.id
         isConnected = true
     }
     
@@ -60,29 +241,59 @@ final class ADBDevice: DeviceProtocol {
     }
     
     func download(from remotePath: String, to localURL: URL,
-                  progress: @escaping (Double) -> Void) async throws {
+                  progress: @escaping (Double) -> Void,
+                  cancellation: TransferCancellationToken) async throws {
         guard isConnected, let deviceId else { throw DeviceError.notConnected }
-        
-        // adb pull <remote> <local> — 解析 stderr 中的进度
+
+        let partialURL = URL(fileURLWithPath:
+            localURL.path + ".nextaft-\(UUID().uuidString).part")
+        var committed = false
+        defer {
+            if !committed {
+                try? FileManager.default.removeItem(at: partialURL)
+            }
+        }
+
+        // adb 自身会在 stderr 输出百分比，无需同步执行 stat 查询文件大小。
         try await runADBWithProgress(
-            ["-s", deviceId, "pull", remotePath, localURL.path],
-            fileSize: fileSizeForProgress(remotePath),
-            progress: progress
+            ["-s", deviceId, "pull", remotePath, partialURL.path],
+            progress: progress,
+            cancellation: cancellation
         )
+        try cancellation.checkCancellation()
+
+        if FileManager.default.fileExists(atPath: localURL.path) {
+            _ = try FileManager.default.replaceItemAt(localURL, withItemAt: partialURL)
+        } else {
+            try FileManager.default.moveItem(at: partialURL, to: localURL)
+        }
+        committed = true
     }
     
     func upload(from localURL: URL, to remotePath: String,
-                progress: @escaping (Double) -> Void) async throws {
+                progress: @escaping (Double) -> Void,
+                cancellation: TransferCancellationToken) async throws {
         guard isConnected, let deviceId else { throw DeviceError.notConnected }
-        
-        let fileSize = (try? FileManager.default.attributesOfItem(atPath: localURL.path)[.size] as? UInt64) ?? 0
-        
-        // adb push <local> <remote> — 解析 stderr 中的进度
-        try await runADBWithProgress(
-            ["-s", deviceId, "push", localURL.path, remotePath],
-            fileSize: fileSize,
-            progress: progress
-        )
+
+        let partialPath = remotePath + ".nextaft-\(UUID().uuidString).part"
+        do {
+            // 先上传到临时名称；只有完整传输后才原子替换目标文件。
+            try await runADBWithProgress(
+                ["-s", deviceId, "push", localURL.path, partialPath],
+                progress: progress,
+                cancellation: cancellation
+            )
+            try cancellation.checkCancellation()
+            _ = try await runADB([
+                "-s", deviceId, "shell",
+                "mv -f \(partialPath.shellEscaped) \(remotePath.shellEscaped)"
+            ], cancellation: cancellation)
+        } catch {
+            _ = try? await runADB([
+                "-s", deviceId, "shell", "rm -f \(partialPath.shellEscaped)"
+            ])
+            throw error
+        }
     }
     
     func deleteFile(at path: String) async throws {
@@ -146,119 +357,65 @@ final class ADBDevice: DeviceProtocol {
         return UInt64(parts[3])
     }
     
-    /// 获取远程文件大小（用于计算进度百分比）
-    private func fileSizeForProgress(_ remotePath: String) -> UInt64 {
-        // 尝试通过 adb shell stat 获取文件大小，失败则返回 0
-        // 返回 0 时进度回调仍会工作，只是百分比计算会跳过
-        guard let deviceId else { return 0 }
-        let semaphore = DispatchSemaphore(value: 0)
-        var size: UInt64 = 0
-        Task {
-            if let output = try? await runADB(["-s", deviceId, "shell", "stat -c %s \(remotePath.shellEscaped)"]) {
-                size = UInt64(output.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
-            }
-            semaphore.signal()
-        }
-        semaphore.wait()
-        return size
-    }
-    
     // MARK: - Process Execution (Non-blocking)
     
     /// 执行 adb 命令（不阻塞主线程）
     @discardableResult
-    private func runADB(_ arguments: [String]) async throws -> String {
-        try await withCheckedThrowingContinuation { continuation in
-            let box = ContinuationBox(continuation)
-            let process = Process()
-            let outputPipe = Pipe()
-            
-            process.executableURL = URL(fileURLWithPath: adbPath)
-            process.arguments = arguments
-            process.standardOutput = outputPipe
-            process.standardError = FileHandle.nullDevice
-            
-            process.terminationHandler = { _ in
-                let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
-                let output = String(data: data, encoding: .utf8) ?? ""
-                
-                if process.terminationStatus == 0 {
-                    box.resume(returning: output)
-                } else {
-                    box.resume(throwing: DeviceError.processError(output))
-                }
+    private func runADB(_ arguments: [String], timeout: TimeInterval? = 30,
+                        cancellation: TransferCancellationToken? = nil) async throws -> String {
+        guard let adbURL else { throw DeviceError.adbNotFound }
+        do {
+            try cancellation?.checkCancellation()
+            let result = try await ADBProcessRunner(
+                executableURL: adbURL,
+                arguments: arguments
+            ).run(timeout: timeout, cancellation: cancellation)
+            try cancellation?.checkCancellation()
+            guard result.status == 0 else {
+                throw DeviceError.processError(Self.errorMessage(from: result))
             }
-            
-            do {
-                try process.run()
-            } catch {
-                box.resume(throwing: DeviceError.processError(error.localizedDescription))
-            }
+            return result.standardOutput
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let error as DeviceError {
+            throw error
+        } catch {
+            throw DeviceError.processError(error.localizedDescription)
         }
     }
     
     /// 执行 adb 命令并解析 stderr 中的进度信息（不阻塞主线程）
-    private func runADBWithProgress(_ arguments: [String], fileSize: UInt64,
-                                     progress: @escaping (Double) -> Void) async throws {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            let box = ContinuationBox(continuation)
-            let process = Process()
-            let outputPipe = Pipe()
-            let errorPipe = Pipe()
-            
-            process.executableURL = URL(fileURLWithPath: adbPath)
-            process.arguments = arguments
-            process.standardOutput = outputPipe
-            process.standardError = errorPipe
-            
-            // 实时读取 stderr 获取进度
-            let errorHandle = errorPipe.fileHandleForReading
-            errorHandle.readabilityHandler = { handle in
-                let data = handle.availableData
-                guard !data.isEmpty else { return }
-                if let text = String(data: data, encoding: .utf8) {
-                    // adb 进度格式: "[  5%] /path/to/file" 或 "[100%] /path/to/file"
-                    let lines = text.components(separatedBy: "\n")
-                    for line in lines {
-                        if let percentStr = line.components(separatedBy: "%]").first,
-                           let bracketIndex = percentStr.lastIndex(of: "["),
-                           percentStr[bracketIndex...].count > 1 {
-                            let numStr = percentStr[percentStr.index(after: bracketIndex)...]
-                                .trimmingCharacters(in: .whitespaces)
-                            if let percent = Double(numStr) {
-                                Task { @MainActor in
-                                    progress(percent / 100.0)
-                                }
-                            }
-                        }
-                    }
-                }
+    private func runADBWithProgress(_ arguments: [String],
+                                    progress: @escaping (Double) -> Void,
+                                    cancellation: TransferCancellationToken) async throws {
+        guard let adbURL else { throw DeviceError.adbNotFound }
+        do {
+            try cancellation.checkCancellation()
+            let result = try await ADBProcessRunner(
+                executableURL: adbURL,
+                arguments: arguments,
+                progress: progress
+            ).run(timeout: nil, cancellation: cancellation)
+            try cancellation.checkCancellation()
+            guard result.status == 0 else {
+                throw DeviceError.transferFailed(Self.errorMessage(from: result))
             }
-            
-            process.terminationHandler = { _ in
-                // 停止读取 stderr
-                errorHandle.readabilityHandler = nil
-                
-                let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
-                let errorData = errorHandle.readDataToEndOfFile()
-                
-                if process.terminationStatus == 0 {
-                    Task { @MainActor in progress(1.0) }
-                    box.resume(returning: ())
-                } else {
-                    let errorOutput = String(data: errorData, encoding: .utf8)
-                        ?? String(data: outputData, encoding: .utf8)
-                        ?? "未知错误"
-                    box.resume(throwing: DeviceError.transferFailed(errorOutput))
-                }
-            }
-            
-            do {
-                try process.run()
-            } catch {
-                box.resume(throwing: DeviceError.processError(error.localizedDescription))
-            }
+            progress(1.0)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let error as DeviceError {
+            throw error
+        } catch {
+            throw DeviceError.processError(error.localizedDescription)
         }
+    }
+
+    nonisolated private static func errorMessage(from result: ADBProcessResult) -> String {
+        let stderr = result.standardError.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !stderr.isEmpty { return stderr }
+        let stdout = result.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !stdout.isEmpty { return stdout }
+        return "adb 已退出，状态码：\(result.status)"
     }
     
     // MARK: - ls -la 解析
@@ -333,24 +490,54 @@ final class ADBDevice: DeviceProtocol {
     
     // MARK: - ADB 查找
     
-    static func findADB() -> String {
+    nonisolated static func findADB() -> URL? {
         // 1. App Bundle 内嵌
-        if let bundlePath = Bundle.main.path(forResource: "adb", ofType: nil) {
-            return bundlePath
+        let bundledCandidates = [
+            Bundle.main.url(forAuxiliaryExecutable: "adb"),
+            Bundle.main.url(forResource: "adb", withExtension: nil)
+        ].compactMap { $0 }
+        if let bundled = bundledCandidates.first(where: {
+            FileManager.default.isExecutableFile(atPath: $0.path)
+        }) {
+            return bundled.resolvingSymlinksInPath()
         }
-        // 2. 常见路径
-        let commonPaths = [
+
+        // 2. Android SDK 环境变量和常见路径
+        let environment = ProcessInfo.processInfo.environment
+        var candidates: [String] = []
+        for variable in ["ANDROID_HOME", "ANDROID_SDK_ROOT"] {
+            if let sdkRoot = environment[variable], !sdkRoot.isEmpty {
+                candidates.append(
+                    URL(fileURLWithPath: sdkRoot)
+                        .appendingPathComponent("platform-tools/adb").path
+                )
+            }
+        }
+        candidates.append(contentsOf: [
             "/usr/local/bin/adb",
             "/opt/homebrew/bin/adb",
             "\(NSHomeDirectory())/Library/Android/sdk/platform-tools/adb"
-        ]
-        for path in commonPaths {
-            if FileManager.default.fileExists(atPath: path) {
-                return path
+        ])
+
+        // 3. Process 不会自行搜索 PATH，因此在这里显式展开每一项目录。
+        if let path = environment["PATH"] {
+            candidates.append(contentsOf: path.split(separator: ":").map {
+                URL(fileURLWithPath: String($0)).appendingPathComponent("adb").path
+            })
+        }
+
+        for path in candidates {
+            if let url = executableURL(at: path) {
+                return url
             }
         }
-        // 3. 默认期望在 PATH 中
-        return "adb"
+        return nil
+    }
+
+    nonisolated private static func executableURL(at path: String) -> URL? {
+        let url = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
+        guard FileManager.default.isExecutableFile(atPath: url.path) else { return nil }
+        return url
     }
 }
 

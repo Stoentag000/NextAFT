@@ -2,7 +2,7 @@ import Foundation
 
 /// Thread-safe wrapper around CheckedContinuation that guarantees resume is called at most once.
 /// Used by both ADB and MTP device implementations for bridging callback-based APIs to async/await.
-final class ContinuationBox<T, E: Error>: @unchecked Sendable {
+nonisolated final class ContinuationBox<T, E: Error>: @unchecked Sendable {
     private var continuation: CheckedContinuation<T, E>?
     private let lock = NSLock()
 

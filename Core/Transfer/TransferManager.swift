@@ -15,7 +15,20 @@ final class TransferManager: ObservableObject {
     }
     
     private let maxConcurrent = 3
-    private var taskQueue: [TransferTask] = []
+    private struct QueueItem {
+        let task: TransferTask
+        let device: DeviceProtocol
+        let cancellation: TransferCancellationToken
+    }
+
+    private struct ActiveTransfer {
+        let device: DeviceProtocol
+        let cancellation: TransferCancellationToken
+        let operation: Task<Void, Never>
+    }
+
+    private var taskQueue: [QueueItem] = []
+    private var activeTransfers: [UUID: ActiveTransfer] = [:]
     
     /// 添加下载任务（手机 → Mac）
     func enqueueDownload(
@@ -33,8 +46,12 @@ final class TransferManager: ObservableObject {
             direction: .downloadToMac
         )
         tasks.append(task)
-        taskQueue.append(task)
-        processQueue(device: device)
+        taskQueue.append(QueueItem(
+            task: task,
+            device: device,
+            cancellation: TransferCancellationToken()
+        ))
+        processQueue()
     }
     
     /// 添加上传任务（Mac → 手机）
@@ -54,75 +71,126 @@ final class TransferManager: ObservableObject {
             direction: .uploadToPhone
         )
         tasks.append(task)
-        taskQueue.append(task)
-        processQueue(device: device)
+        taskQueue.append(QueueItem(
+            task: task,
+            device: device,
+            cancellation: TransferCancellationToken()
+        ))
+        processQueue()
     }
     
-    private func processQueue(device: DeviceProtocol) {
-        guard activeTaskCount < maxConcurrent, !taskQueue.isEmpty else { return }
-        
-        let task = taskQueue.removeFirst()
-        activeTaskCount += 1
-        
-        Task {
-            var mutableTask = task
-            mutableTask.status = .inProgress
-            updateTask(mutableTask)
-            
-            do {
-                let progressHandler: (Double) -> Void = { [weak self] progress in
-                    Task { @MainActor in
-                        self?.updateProgress(taskId: task.id, progress: progress)
-                    }
-                }
-                
-                switch task.direction {
-                case .downloadToMac:
-                    try await device.download(
-                        from: task.sourcePath,
-                        to: URL(fileURLWithPath: task.destinationPath),
-                        progress: progressHandler
-                    )
-                case .uploadToPhone:
-                    try await device.upload(
-                        from: URL(fileURLWithPath: task.sourcePath),
-                        to: task.destinationPath,
-                        progress: progressHandler
-                    )
-                }
-                
-                mutableTask.status = .completed
-                mutableTask.progress = 1.0
-                mutableTask.endDate = Date()
-            } catch {
-                mutableTask.status = .failed(error.localizedDescription)
-                mutableTask.endDate = Date()
+    private func processQueue() {
+        while activeTransfers.count < maxConcurrent, !taskQueue.isEmpty {
+            let item = taskQueue.removeFirst()
+            guard let index = tasks.firstIndex(where: { $0.id == item.task.id }),
+                  tasks[index].status == .pending else { continue }
+
+            tasks[index].status = .inProgress
+            let operation = Task { [weak self] in
+                guard let self else { return }
+                await self.execute(item)
             }
-            
-            updateTask(mutableTask)
-            activeTaskCount -= 1
-            processQueue(device: device)
+            activeTransfers[item.task.id] = ActiveTransfer(
+                device: item.device,
+                cancellation: item.cancellation,
+                operation: operation
+            )
         }
+        activeTaskCount = activeTransfers.count
     }
-    
-    private func updateTask(_ task: TransferTask) {
-        if let index = tasks.firstIndex(where: { $0.id == task.id }) {
-            tasks[index] = task
+
+    private func execute(_ item: QueueItem) async {
+        let task = item.task
+        do {
+            try item.cancellation.checkCancellation()
+            let progressHandler: (Double) -> Void = { [weak self] progress in
+                Task { @MainActor in
+                    self?.updateProgress(taskId: task.id, progress: progress)
+                }
+            }
+
+            switch task.direction {
+            case .downloadToMac:
+                try await item.device.download(
+                    from: task.sourcePath,
+                    to: URL(fileURLWithPath: task.destinationPath),
+                    progress: progressHandler,
+                    cancellation: item.cancellation
+                )
+            case .uploadToPhone:
+                try await item.device.upload(
+                    from: URL(fileURLWithPath: task.sourcePath),
+                    to: task.destinationPath,
+                    progress: progressHandler,
+                    cancellation: item.cancellation
+                )
+            }
+
+            try item.cancellation.checkCancellation()
+            if let index = tasks.firstIndex(where: { $0.id == task.id }) {
+                tasks[index].status = .completed
+                tasks[index].progress = 1.0
+                tasks[index].transferredBytes = tasks[index].fileSize
+                tasks[index].endDate = Date()
+            }
+        } catch {
+            if let index = tasks.firstIndex(where: { $0.id == task.id }) {
+                if item.cancellation.isCancellationRequested ||
+                    error is CancellationError || Task.isCancelled {
+                    tasks[index].status = .cancelled
+                } else {
+                    tasks[index].status = .failed(error.localizedDescription)
+                }
+                tasks[index].endDate = Date()
+            }
         }
+
+        activeTransfers.removeValue(forKey: task.id)
+        activeTaskCount = activeTransfers.count
+        processQueue()
     }
     
     private func updateProgress(taskId: UUID, progress: Double) {
-        if let index = tasks.firstIndex(where: { $0.id == taskId }) {
-            tasks[index].progress = progress
-            tasks[index].transferredBytes = UInt64(progress * Double(tasks[index].fileSize))
-        }
+        guard let index = tasks.firstIndex(where: { $0.id == taskId }),
+              tasks[index].status == .inProgress else { return }
+        let value = min(max(progress, 0), 1)
+        tasks[index].progress = value
+        tasks[index].transferredBytes = UInt64(value * Double(tasks[index].fileSize))
     }
     
     func cancelTask(_ task: TransferTask) {
-        if let index = tasks.firstIndex(where: { $0.id == task.id }) {
-            tasks[index].status = .cancelled
+        cancelTask(id: task.id)
+    }
+
+    func cancelTasks(for device: DeviceProtocol) {
+        let queuedIDs = taskQueue
+            .filter { $0.device === device }
+            .map(\.task.id)
+        let activeIDs = activeTransfers
+            .filter { $0.value.device === device }
+            .map(\.key)
+        for id in Set(queuedIDs + activeIDs) {
+            cancelTask(id: id)
         }
-        taskQueue.removeAll { $0.id == task.id }
+    }
+
+    private func cancelTask(id: UUID) {
+        guard let index = tasks.firstIndex(where: { $0.id == id }),
+              tasks[index].status == .pending ||
+                tasks[index].status == .inProgress else { return }
+
+        let queued = taskQueue.filter { $0.task.id == id }
+        taskQueue.removeAll { $0.task.id == id }
+        queued.forEach { $0.cancellation.cancel() }
+
+        if let active = activeTransfers[id] {
+            active.cancellation.cancel()
+            active.operation.cancel()
+        }
+
+        tasks[index].status = .cancelled
+        tasks[index].endDate = Date()
+        processQueue()
     }
     
     func clearCompleted() {

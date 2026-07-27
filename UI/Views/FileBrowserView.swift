@@ -16,6 +16,7 @@ struct FileBrowserView: View {
         .toolbar {
             ToolbarItemGroup(placement: .navigation) {
                 ProtocolSelector(selected: $viewModel.selectedProtocol)
+                    .disabled(viewModel.isConnected)
                 
                 Button {
                     Task { 

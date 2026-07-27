@@ -117,6 +117,9 @@ final class FileBrowserViewModel: ObservableObject {
         
         do {
             try await device?.connect()
+            if let device {
+                remotePath = device.getRootPath()
+            }
             isConnected = true
             await loadRemoteFiles()
         } catch {
@@ -125,7 +128,10 @@ final class FileBrowserViewModel: ObservableObject {
     }
     
     func disconnect() async {
-        try? await device?.disconnect()
+        if let device {
+            transferManager.cancelTasks(for: device)
+            try? await device.disconnect()
+        }
         device = nil
         isConnected = false
         remoteFiles = []

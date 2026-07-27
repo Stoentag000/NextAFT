@@ -1,237 +1,434 @@
 import Foundation
 
-/// Wraps a Swift closure so it can be passed through a C `void *userdata` parameter.
-/// C function pointers can't capture context; this box is heap-allocated and passed as an opaque pointer.
-final class ProgressCallbackBox: @unchecked Sendable {
-    let callback: (Double) -> Void
-    init(_ callback: @escaping (Double) -> Void) { self.callback = callback }
+/// Value types returned by the background MTP worker. AFTL pointers never
+/// leave the worker's serial queue.
+nonisolated private struct MTPFileEntry: Sendable {
+    let name: String
+    let size: UInt64
+    let isDirectory: Bool
 }
 
-/// MTP 协议实现 — 通过 AFTL (android-file-transfer-linux) C wrapper 与设备通信
+nonisolated private struct MTPDeviceDetails: Sendable {
+    let manufacturer: String
+    let model: String
+    let serial: String
+    let storageTotal: UInt64?
+    let storageFree: UInt64?
+}
+
+nonisolated private struct MTPBridgeError: LocalizedError, Sendable {
+    let message: String
+    var errorDescription: String? { message }
+}
+
+/// C callbacks cannot capture a Swift closure. This Sendable box is retained
+/// by the worker operation for the complete duration of the synchronous C call.
+nonisolated private final class MTPTransferCallbackBox: @unchecked Sendable {
+    let callback: (Double) -> Void
+    let cancellation: TransferCancellationToken
+
+    init(_ callback: @escaping (Double) -> Void,
+         cancellation: TransferCancellationToken) {
+        self.callback = callback
+        self.cancellation = cancellation
+    }
+}
+
+nonisolated private final class MTPCancellationRequest: @unchecked Sendable {
+    let handle: AFTLSessionRef
+    let transferID: UInt64
+
+    init(handle: AFTLSessionRef, transferID: UInt64) {
+        self.handle = handle
+        self.transferID = transferID
+    }
+}
+
+/// Owns the raw AFTL handle and confines all access to one serial queue.
+/// MTP is transaction-based, so running three transfers concurrently against
+/// one USB session is unsafe even though the app-level queue supports it.
+nonisolated private final class MTPWorker: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "com.stoentag.NextAFT.mtp-worker",
+                                      qos: .userInitiated)
+    private let cancellationQueue = DispatchQueue(
+        label: "com.stoentag.NextAFT.mtp-cancellation",
+        qos: .userInitiated
+    )
+    private let queueKey = DispatchSpecificKey<UInt8>()
+    private let cancellationQueueKey = DispatchSpecificKey<UInt8>()
+    private var handle: AFTLSessionRef?
+    private var nextTransferID: UInt64 = 1
+
+    init() {
+        queue.setSpecific(key: queueKey, value: 1)
+        cancellationQueue.setSpecific(key: cancellationQueueKey, value: 1)
+    }
+
+    deinit {
+        let close = { [self] in
+            drainCancellationQueue()
+            if let handle {
+                aftl_disconnect(handle)
+                self.handle = nil
+            }
+        }
+        if DispatchQueue.getSpecific(key: queueKey) != nil {
+            close()
+        } else {
+            queue.sync(execute: close)
+        }
+    }
+
+    func connect() async throws {
+        try await enqueue { [self] in
+            if handle != nil {
+                return
+            }
+            guard let newHandle = aftl_connect(), aftl_is_connected(newHandle) else {
+                throw bridgeError(fallback: "未找到可用的 MTP 设备")
+            }
+            handle = newHandle
+        }
+    }
+
+    func disconnect() async {
+        await enqueueWithoutThrowing { [self] in
+            drainCancellationQueue()
+            if let handle {
+                aftl_disconnect(handle)
+                self.handle = nil
+            }
+        }
+    }
+
+    func listFiles(at path: String) async throws -> [MTPFileEntry] {
+        try await enqueue { [self] in
+            let handle = try connectedHandle()
+            var fileList = AFTLFileList()
+            let result = aftl_list_files(handle, path, &fileList)
+            guard result == 0 else {
+                throw bridgeError(fallback: "无法读取 MTP 目录：\(path)")
+            }
+            defer { aftl_free_file_list(&fileList) }
+
+            guard fileList.count > 0 else { return [] }
+            guard let items = fileList.items else {
+                throw MTPBridgeError(message: "AFTL 返回了无效的文件列表")
+            }
+
+            let count = Int(fileList.count)
+            return (0..<count).map { index in
+                let item = items[index]
+                return MTPFileEntry(
+                    name: item.name.map { String(cString: $0) } ?? "",
+                    size: item.size,
+                    isDirectory: item.is_directory
+                )
+            }
+        }
+    }
+
+    func download(from remotePath: String, to localPath: String,
+                  progress: @escaping (Double) -> Void,
+                  cancellation: TransferCancellationToken) async throws {
+        let callbackBox = MTPTransferCallbackBox(
+            progress,
+            cancellation: cancellation
+        )
+        try await enqueue { [self, callbackBox, cancellation] in
+            try cancellation.checkCancellation()
+            let handle = try connectedHandle()
+            var objectID: UInt32 = 0
+            guard aftl_resolve_path(handle, remotePath, &objectID) == 0,
+                  objectID != 0 else {
+                throw bridgeError(fallback: "MTP 文件不存在：\(remotePath)")
+            }
+
+            let transferID = makeTransferID()
+            let cancellationRequest = MTPCancellationRequest(
+                handle: handle,
+                transferID: transferID
+            )
+            let registration = cancellation.register { [weak self, cancellationRequest] in
+                self?.requestCancellation(cancellationRequest)
+            }
+            defer { cancellation.unregister(registration) }
+            try cancellation.checkCancellation()
+
+            let context = Unmanaged.passUnretained(callbackBox).toOpaque()
+            let result = aftl_download(handle, objectID, localPath, { value, context in
+                guard let context else { return }
+                Unmanaged<MTPTransferCallbackBox>
+                    .fromOpaque(context)
+                    .takeUnretainedValue()
+                    .callback(value)
+            }, context, { context in
+                guard let context else { return false }
+                return Unmanaged<MTPTransferCallbackBox>
+                    .fromOpaque(context)
+                    .takeUnretainedValue()
+                    .cancellation.isCancellationRequested
+            }, context, transferID)
+            try cancellation.checkCancellation()
+            guard result == 0 else {
+                throw bridgeError(fallback: "MTP 下载失败")
+            }
+        }
+    }
+
+    func upload(from localPath: String, to remotePath: String,
+                progress: @escaping (Double) -> Void,
+                cancellation: TransferCancellationToken) async throws {
+        let callbackBox = MTPTransferCallbackBox(
+            progress,
+            cancellation: cancellation
+        )
+        try await enqueue { [self, callbackBox, cancellation] in
+            try cancellation.checkCancellation()
+            let handle = try connectedHandle()
+            let remoteURL = URL(fileURLWithPath: remotePath)
+            let parentPath = remoteURL.deletingLastPathComponent().path
+            let remoteName = remoteURL.lastPathComponent
+
+            var parentID: UInt32 = 0
+            guard !remoteName.isEmpty,
+                  aftl_resolve_path(handle, parentPath, &parentID) == 0 else {
+                throw bridgeError(fallback: "MTP 目标目录不存在：\(parentPath)")
+            }
+
+            let transferID = makeTransferID()
+            let cancellationRequest = MTPCancellationRequest(
+                handle: handle,
+                transferID: transferID
+            )
+            let registration = cancellation.register { [weak self, cancellationRequest] in
+                self?.requestCancellation(cancellationRequest)
+            }
+            defer { cancellation.unregister(registration) }
+            try cancellation.checkCancellation()
+
+            let context = Unmanaged.passUnretained(callbackBox).toOpaque()
+            var newObjectID: UInt32 = 0
+            let result = aftl_upload(handle, localPath, remoteName, parentID, {
+                value, context in
+                guard let context else { return }
+                Unmanaged<MTPTransferCallbackBox>
+                    .fromOpaque(context)
+                    .takeUnretainedValue()
+                    .callback(value)
+            }, context, { context in
+                guard let context else { return false }
+                return Unmanaged<MTPTransferCallbackBox>
+                    .fromOpaque(context)
+                    .takeUnretainedValue()
+                    .cancellation.isCancellationRequested
+            }, context, transferID, &newObjectID)
+            try cancellation.checkCancellation()
+            guard result == 0 else {
+                throw bridgeError(fallback: "MTP 上传失败")
+            }
+        }
+    }
+
+    func deleteFile(at path: String) async throws {
+        try await enqueue { [self] in
+            let handle = try connectedHandle()
+            var objectID: UInt32 = 0
+            guard aftl_resolve_path(handle, path, &objectID) == 0,
+                  objectID != 0 else {
+                throw bridgeError(fallback: "MTP 文件不存在：\(path)")
+            }
+            guard aftl_delete(handle, objectID) == 0 else {
+                throw bridgeError(fallback: "MTP 删除失败：\(path)")
+            }
+        }
+    }
+
+    func createDirectory(at path: String) async throws {
+        try await enqueue { [self] in
+            let handle = try connectedHandle()
+            let directoryURL = URL(fileURLWithPath: path)
+            let parentPath = directoryURL.deletingLastPathComponent().path
+            let directoryName = directoryURL.lastPathComponent
+
+            var parentID: UInt32 = 0
+            guard !directoryName.isEmpty,
+                  aftl_resolve_path(handle, parentPath, &parentID) == 0 else {
+                throw bridgeError(fallback: "MTP 父目录不存在：\(parentPath)")
+            }
+
+            var newDirectoryID: UInt32 = 0
+            guard aftl_mkdir(handle, directoryName, parentID,
+                             &newDirectoryID) == 0 else {
+                throw bridgeError(fallback: "MTP 创建目录失败：\(path)")
+            }
+        }
+    }
+
+    func deviceDetails() async throws -> MTPDeviceDetails {
+        try await enqueue { [self] in
+            let handle = try connectedHandle()
+            var info = aftl_get_device_info(handle)
+            defer { aftl_free_device_info(&info) }
+
+            if let error = currentError(), !error.isEmpty {
+                throw MTPBridgeError(message: error)
+            }
+            return MTPDeviceDetails(
+                manufacturer: info.manufacturer.map { String(cString: $0) } ?? "",
+                model: info.model.map { String(cString: $0) } ?? "",
+                serial: info.serial.map { String(cString: $0) } ?? "",
+                storageTotal: info.storage_total == 0 ? nil : info.storage_total,
+                storageFree: info.storage_total == 0 ? nil : info.storage_free
+            )
+        }
+    }
+
+    private func connectedHandle() throws -> AFTLSessionRef {
+        guard let handle else {
+            throw MTPBridgeError(message: "MTP 设备未连接")
+        }
+        return handle
+    }
+
+    private func makeTransferID() -> UInt64 {
+        let id = nextTransferID
+        nextTransferID &+= 1
+        if nextTransferID == 0 {
+            nextTransferID = 1
+        }
+        return id
+    }
+
+    private func requestCancellation(_ request: MTPCancellationRequest) {
+        cancellationQueue.async {
+            _ = aftl_cancel_transfer(request.handle, request.transferID)
+        }
+    }
+
+    private func drainCancellationQueue() {
+        guard DispatchQueue.getSpecific(key: cancellationQueueKey) == nil else { return }
+        cancellationQueue.sync {}
+    }
+
+    private func bridgeError(fallback: String) -> MTPBridgeError {
+        MTPBridgeError(message: currentError().flatMap { $0.isEmpty ? nil : $0 }
+                       ?? fallback)
+    }
+
+    private func currentError() -> String? {
+        guard let pointer = aftl_last_error() else { return nil }
+        return String(cString: pointer)
+    }
+
+    private func enqueue<T: Sendable>(
+        _ operation: @escaping @Sendable () throws -> T
+    ) async throws -> T {
+        try await withCheckedThrowingContinuation { continuation in
+            queue.async {
+                do {
+                    continuation.resume(returning: try operation())
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    private func enqueueWithoutThrowing(
+        _ operation: @escaping @Sendable () -> Void
+    ) async {
+        await withCheckedContinuation { continuation in
+            queue.async {
+                operation()
+                continuation.resume()
+            }
+        }
+    }
+}
+
+/// MTP implementation backed by android-file-transfer-linux.
+@MainActor
 final class MTPDevice: DeviceProtocol {
     let name = "MTP Device"
     let protocolType: ProtocolType = .mtp
     private(set) var isConnected = false
 
-    /// Opaque handle to the C++ session (AFTLSessionRef)
-    private var sessionHandle: AFTLSessionRef?
-
-    // MARK: - Connection
+    private let worker = MTPWorker()
 
     func connect() async throws {
-        let handle = aftl_connect()
-        guard let handle, aftl_is_connected(handle) else {
-            throw DeviceError.noDeviceFound
-        }
-        sessionHandle = handle
+        guard !isConnected else { return }
+        try await worker.connect()
         isConnected = true
     }
 
     func disconnect() async throws {
-        if let handle = sessionHandle {
-            aftl_disconnect(handle)
-        }
-        sessionHandle = nil
         isConnected = false
+        await worker.disconnect()
     }
 
-    // MARK: - File Listing
-
     func listFiles(at path: String) async throws -> [RemoteFile] {
-        guard let handle = sessionHandle else { throw DeviceError.notConnected }
-
-        var fileList = AFTLFileList()
-        let rc = aftl_list_files(handle, path, &fileList)
-        guard rc == 0 else {
-            throw DeviceError.fileNotFound(path)
-        }
-
-        defer { aftl_free_file_list(&fileList) }
-
-        var result: [RemoteFile] = []
-        result.reserveCapacity(Int(fileList.count))
-
-        for i in 0..<Int(fileList.count) {
-            let item = fileList.items[i]
-            let name = String(cString: item.name)
+        let entries = try await worker.listFiles(at: path)
+        return entries.map { entry in
             let fullPath = path.hasSuffix("/")
-                ? "\(path)\(name)"
-                : "\(path)/\(name)"
-
-            result.append(RemoteFile(
-                name: name,
+                ? "\(path)\(entry.name)"
+                : "\(path)/\(entry.name)"
+            return RemoteFile(
+                name: entry.name,
                 path: fullPath,
-                size: item.size,
-                isDirectory: item.is_directory,
+                size: entry.size,
+                isDirectory: entry.isDirectory,
                 modifiedDate: nil,
                 mimeType: nil
-            ))
+            )
         }
-
-        // Sort: directories first, then by name
-        result.sort { lhs, rhs in
+        .sorted { lhs, rhs in
             if lhs.isDirectory != rhs.isDirectory { return lhs.isDirectory }
             return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
         }
-
-        return result
     }
-
-    // MARK: - Download
 
     func download(from remotePath: String, to localURL: URL,
-                  progress: @escaping (Double) -> Void) async throws {
-        guard let handle = sessionHandle else { throw DeviceError.notConnected }
-
-        // Resolve path → object ID
-        var objectId: UInt32 = 0
-        let resolveRC = aftl_resolve_path(handle, remotePath, &objectId)
-        guard resolveRC == 0, objectId != 0 else {
-            throw DeviceError.fileNotFound(remotePath)
-        }
-
-        // Download with progress callback
-        // C function pointers can't capture context, so we pass the Swift closure
-        // through the C `void *userdata` parameter.
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            let box = ContinuationBox(continuation)
-
-            // Wrap the Swift progress closure as an opaque pointer
-            let progressBox = ProgressCallbackBox(progress)
-            let progressPtr = Unmanaged.passRetained(progressBox).toOpaque()
-
-            DispatchQueue.global(qos: .userInitiated).async {
-                let rc = aftl_download(handle, objectId, localURL.path, { prog, ud in
-                    // Recover the Swift closure from userdata and call it
-                    guard let ud else { return }
-                    Unmanaged<ProgressCallbackBox>
-                        .fromOpaque(ud)
-                        .takeUnretainedValue()
-                        .callback(prog)
-                }, progressPtr)
-
-                // Release the boxed closure
-                Unmanaged<ProgressCallbackBox>.fromOpaque(progressPtr).release()
-
-                if rc == 0 {
-                    box.resume(returning: ())
-                } else {
-                    box.resume(throwing: DeviceError.transferFailed(
-                        "MTP download failed with code \(rc)"))
-                }
-            }
-        }
+                  progress: @escaping (Double) -> Void,
+                  cancellation: TransferCancellationToken) async throws {
+        try await worker.download(from: remotePath, to: localURL.path,
+                                  progress: progress,
+                                  cancellation: cancellation)
     }
-
-    // MARK: - Upload
 
     func upload(from localURL: URL, to remotePath: String,
-                progress: @escaping (Double) -> Void) async throws {
-        guard let handle = sessionHandle else { throw DeviceError.notConnected }
-
-        // Resolve parent directory path → object ID
-        let parentPath = (remotePath as NSString).deletingLastPathComponent
-        var parentId: UInt32 = 0
-        let resolveRC = aftl_resolve_path(handle, parentPath, &parentId)
-        guard resolveRC == 0 else {
-            throw DeviceError.fileNotFound(parentPath)
-        }
-
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            let box = ContinuationBox(continuation)
-
-            let progressBox = ProgressCallbackBox(progress)
-            let progressPtr = Unmanaged.passRetained(progressBox).toOpaque()
-
-            DispatchQueue.global(qos: .userInitiated).async {
-                var newObjectId: UInt32 = 0
-                let rc = aftl_upload(handle, localURL.path, parentId, { prog, ud in
-                    guard let ud else { return }
-                    Unmanaged<ProgressCallbackBox>
-                        .fromOpaque(ud)
-                        .takeUnretainedValue()
-                        .callback(prog)
-                }, progressPtr, &newObjectId)
-
-                Unmanaged<ProgressCallbackBox>.fromOpaque(progressPtr).release()
-
-                if rc == 0 {
-                    box.resume(returning: ())
-                } else {
-                    box.resume(throwing: DeviceError.transferFailed(
-                        "MTP upload failed with code \(rc)"))
-                }
-            }
-        }
+                progress: @escaping (Double) -> Void,
+                cancellation: TransferCancellationToken) async throws {
+        try await worker.upload(from: localURL.path, to: remotePath,
+                                progress: progress,
+                                cancellation: cancellation)
     }
-
-    // MARK: - Delete
 
     func deleteFile(at path: String) async throws {
-        guard let handle = sessionHandle else { throw DeviceError.notConnected }
-
-        var objectId: UInt32 = 0
-        let rc = aftl_resolve_path(handle, path, &objectId)
-        guard rc == 0, objectId != 0 else {
-            throw DeviceError.fileNotFound(path)
-        }
-
-        let delRC = aftl_delete(handle, objectId)
-        guard delRC == 0 else {
-            throw DeviceError.transferFailed("Delete failed with code \(delRC)")
-        }
+        try await worker.deleteFile(at: path)
     }
-
-    // MARK: - Create Directory
 
     func createDirectory(at path: String) async throws {
-        guard let handle = sessionHandle else { throw DeviceError.notConnected }
-
-        let dirName = (path as NSString).lastPathComponent
-        let parentPath = (path as NSString).deletingLastPathComponent
-
-        var parentId: UInt32 = 0
-        let rc = aftl_resolve_path(handle, parentPath, &parentId)
-        guard rc == 0 else {
-            throw DeviceError.fileNotFound(parentPath)
-        }
-
-        var newDirId: UInt32 = 0
-        let mkdirRC = aftl_mkdir(handle, dirName, parentId, &newDirId)
-        guard mkdirRC == 0 else {
-            throw DeviceError.transferFailed("mkdir failed with code \(mkdirRC)")
-        }
+        try await worker.createDirectory(at: path)
     }
 
-    // MARK: - Device Info
-
     func getDeviceInfo() async throws -> DeviceInfo {
-        guard let handle = sessionHandle else { throw DeviceError.notConnected }
-
-        var info = aftl_get_device_info(handle)
-        defer { aftl_free_device_info(&info) }
-
-        let manufacturer = info.manufacturer.map { String(cString: $0) } ?? ""
-        let model = info.model.map { String(cString: $0) } ?? ""
-        let serial = info.serial.map { String(cString: $0) } ?? ""
-        let displayName = manufacturer.isEmpty ? model : "\(manufacturer) \(model)"
-
+        let details = try await worker.deviceDetails()
+        let displayName = [details.manufacturer, details.model]
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
         return DeviceInfo(
             name: displayName.isEmpty ? "Android Device" : displayName,
-            model: model.isEmpty ? nil : model,
-            serialNumber: serial.isEmpty ? nil : serial,
+            model: details.model.isEmpty ? nil : details.model,
+            serialNumber: details.serial.isEmpty ? nil : details.serial,
             androidVersion: nil,
-            storageTotal: nil,
-            storageFree: nil,
+            storageTotal: details.storageTotal,
+            storageFree: details.storageFree,
             protocolType: .mtp
         )
     }
 
-    // MARK: - Root Path
-
     func getRootPath() -> String {
-        return "/storage/emulated/0"
+        "/storage/emulated/0"
     }
 }
-
-

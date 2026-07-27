@@ -19,7 +19,7 @@ enum DeviceError: LocalizedError {
         case .noDeviceFound:
             return "未找到已连接的设备，请确认 USB 已连接且已授权"
         case .adbNotFound:
-            return "未找到 adb 工具，请安装 Android SDK Platform Tools"
+            return "未找到可执行的 adb，请安装 Android SDK Platform Tools，或将 adb 加入 PATH"
         case .connectionFailed(let msg):
             return "连接失败: \(msg)"
         case .transferFailed(let msg):

@@ -21,6 +21,9 @@ extern "C" {
 // ---------------------------------------------------------------------------
 typedef void *AFTLSessionRef;
 
+typedef void (*AFTLProgressCallback)(double progress, void *userdata);
+typedef bool (*AFTLCancellationCallback)(void *userdata);
+
 // ---------------------------------------------------------------------------
 // File info returned by aftl_list_files
 // ---------------------------------------------------------------------------
@@ -44,6 +47,8 @@ typedef struct {
     char *model;
     char *serial;
     char *storage_description;  // e.g. "32 GB, 18 GB free"
+    uint64_t storage_total;
+    uint64_t storage_free;
 } AFTLDeviceInfo;
 
 // ---------------------------------------------------------------------------
@@ -68,6 +73,10 @@ bool aftl_is_connected(AFTLSessionRef session);
 AFTLDeviceInfo aftl_get_device_info(AFTLSessionRef session);
 void           aftl_free_device_info(AFTLDeviceInfo *info);
 
+/// Human-readable detail for the most recent failure on the calling thread.
+/// The returned pointer remains valid until the next AFTL wrapper call on that thread.
+const char    *aftl_last_error(void);
+
 // ---------------------------------------------------------------------------
 // File listing
 // ---------------------------------------------------------------------------
@@ -89,16 +98,22 @@ void aftl_free_file_list(AFTLFileList *list);
 /// Returns 0 on success.
 int aftl_download(AFTLSessionRef session, uint32_t object_id,
                   const char *local_path,
-                  void (*progress_cb)(double progress, void *userdata),
-                  void *userdata);
+                  AFTLProgressCallback progress_cb, void *progress_userdata,
+                  AFTLCancellationCallback cancellation_cb,
+                  void *cancellation_userdata, uint64_t transfer_id);
 
-/// Upload a local file to the given remote parent directory (by object ID).
+/// Upload a local file with remote_name to the given parent directory (by object ID).
 /// Returns 0 on success; fills *new_object_id if non-NULL.
 int aftl_upload(AFTLSessionRef session, const char *local_path,
-                uint32_t parent_object_id,
-                void (*progress_cb)(double progress, void *userdata),
-                void *userdata,
+                const char *remote_name, uint32_t parent_object_id,
+                AFTLProgressCallback progress_cb, void *progress_userdata,
+                AFTLCancellationCallback cancellation_cb,
+                void *cancellation_userdata, uint64_t transfer_id,
                 uint32_t *new_object_id);
+
+/// Cancel the matching active transfer. Safe to call from another thread.
+/// Returns 0 when cancellation was delivered, 1 if it already ended.
+int aftl_cancel_transfer(AFTLSessionRef session, uint64_t transfer_id);
 
 // ---------------------------------------------------------------------------
 // File operations

@@ -3,7 +3,7 @@
 - 由于Apple将在未来取消Rosetta转译层，现有的Android File Transfer可能无法运行
 - 我为此使用Xiaomi MiMo Claw开发了这款下一代的Android File Transfer
 - NextAFT是一款macOS 端 Android 文件传输工具，通过 USB 连接 Android 手机，实现双向文件管理与传输的工具。
-- 请注意，当前仍处于早期开发版本，无法正常使用
+- 请注意，当前仍处于早期开发版本，MTP 功能需要在不同 Android 设备上继续验证
 
 ## 功能
 
@@ -11,7 +11,7 @@
 - **双协议支持** — ADB（需开启 USB 调试）/ MTP（直连 USB）
 - **文件传输** — 支持上传/下载，传输队列最多 3 个并发任务，实时进度与速度显示
 - **文件操作** — 浏览、进入目录、返回上级、右键菜单（上传/下载/删除）
-- **目录授权** — macOS 沙盒下通过 NSOpenPanel 选择本地目录，Security-Scoped Bookmark 持久化
+- **目录授权** — 通过 NSOpenPanel 选择本地目录，并使用 Bookmark 持久化
 
 ## 系统要求
 
@@ -23,18 +23,14 @@
 
 ## 构建
 
-### 1. 克隆项目（含子模块）
+### 1. 克隆项目
 
 ```bash
-git clone --recurse-submodules <repo-url>
+git clone <repo-url>
 cd NextAFT
 ```
 
-如果已经克隆但没有子模块：
-
-```bash
-git submodule update --init --recursive
-```
+AFTL 源码已经 vendored 在 `Vendor/aftl/`，不需要额外初始化子模块。
 
 ### 2. 编译 AFTL（MTP 支持）
 
@@ -42,24 +38,27 @@ git submodule update --init --recursive
 ./build_aftl.sh
 ```
 
-这会编译 android-file-transfer-linux 静态库，输出到 `Vendor/aftl-output/`。
+这会为 arm64 和 x86_64 编译通用的 android-file-transfer-linux 静态库，输出到
+`Vendor/aftl-output/`。只在 Apple Silicon 本机开发时可使用
+`AFTL_ARCHS=arm64 ./build_aftl.sh` 缩短构建时间。
 
 ### 3. 用 Xcode 打开并构建
 
 1. 用 Xcode 打开 `NextAFT.xcodeproj`
-2. 在 Build Settings 中配置：
-   - **Header Search Paths**: `$(SRCROOT)/Vendor/aftl-output/include`
-   - **Library Search Paths**: `$(SRCROOT)/Vendor/aftl-output/lib`
-   - **Other Linker Flags**: `-lmtp-ng-static -framework IOKit -framework CoreFoundation`
-   - **Objective-C Bridging Header**: `NextAFT/NextAFT-Bridging.h`
-3. 选择目标设备 → Build & Run
+2. 选择目标设备 → Build & Run
+
+头文件、静态库、IOKit、CoreFoundation、Bridging Header 和 USB 权限都已在工程中配置。
+
+> 当前 ADB 模式会调用 Android SDK 中的外部 `adb`，因此 App Sandbox 已关闭，
+> Hardened Runtime 仍然启用，适合签名、公证后站外分发。如果未来需要发布到
+> Mac App Store，应将 `adb` 改为 App Bundle 内嵌且正确签名的 helper。
 
 ADB 路径会自动按以下顺序查找：
 1. App Bundle 内嵌
 2. `/usr/local/bin/adb`
 3. `/opt/homebrew/bin/adb`
 4. `~/Library/Android/sdk/platform-tools/adb`
-5. 系统 PATH
+5. 系统 PATH（由应用显式解析为绝对路径）
 
 ## 项目结构
 
@@ -105,7 +104,7 @@ NextAFT/
 ├── Resources/
 │   └── Info.plist
 │
-├── Vendor/                             # 第三方依赖（git submodule）
+├── Vendor/                             # vendored 第三方依赖
 │   ├── aftl/                           # android-file-transfer-linux 源码
 │   └── aftl-output/                    # 编译产物（.a + headers）
 │

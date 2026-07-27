@@ -19,6 +19,7 @@ struct TransferListView: View {
                 }
                 .disabled(!manager.tasks.contains(where: {
                     if case .completed = $0.status { return true }
+                    if case .cancelled = $0.status { return true }
                     return false
                 }))
                 
@@ -94,7 +95,9 @@ struct TransferTaskRow: View {
                     .font(.caption)
                     .monospacedDigit()
                     .frame(width: 36, alignment: .trailing)
-            } else if task.status == .pending {
+            }
+
+            if task.status == .pending || task.status == .inProgress {
                 Button("取消") {
                     onCancel()
                 }

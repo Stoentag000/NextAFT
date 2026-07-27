@@ -4,7 +4,7 @@
 #  NextAFT
 #
 #  Build android-file-transfer-linux as a static library for NextAFT.
-#  Run this once after cloning, or when updating the AFTL submodule.
+#  Run this once after cloning, or when updating the vendored AFTL source.
 #
 #  Prerequisites:
 #    - CMake 3.10+ (brew install cmake)
@@ -13,6 +13,7 @@
 #  Usage:
 #    ./build_aftl.sh          # Release build
 #    ./build_aftl.sh debug    # Debug build
+#    AFTL_ARCHS=arm64 ./build_aftl.sh  # Apple Silicon only
 #
 
 set -euo pipefail
@@ -21,6 +22,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 AFTL_DIR="${SCRIPT_DIR}/Vendor/aftl"
 BUILD_DIR="${AFTL_DIR}/build"
 BUILD_TYPE="${1:-Release}"
+ARCHITECTURES="${AFTL_ARCHS:-arm64;x86_64}"
 
 # ---------------------------------------------------------------------------
 # Check prerequisites
@@ -32,7 +34,6 @@ fi
 
 if [ ! -d "$AFTL_DIR" ]; then
     echo "❌ AFTL source not found at ${AFTL_DIR}"
-    echo "   Run: git submodule add https://github.com/whoozle/android-file-transfer-linux.git Vendor/aftl"
     exit 1
 fi
 
@@ -49,12 +50,13 @@ cd "$BUILD_DIR"
 cmake "$AFTL_DIR" \
     -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
     -DBUILD_QT_UI=OFF \
-    -DBUILD_SHARED_LIBS=OFF \
+    -DBUILD_SHARED_LIB=OFF \
     -DBUILD_FUSE=OFF \
     -DBUILD_PYTHON=OFF \
     -DBUILD_TAGLIB=OFF \
     -DBUILD_MTPZ=OFF \
-    -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0
+    -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+    -DCMAKE_OSX_ARCHITECTURES="${ARCHITECTURES}"
 
 NPROC=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
 make -j"${NPROC}"
@@ -88,7 +90,4 @@ echo "✅ AFTL build complete!"
 echo "   Library: ${OUTPUT_DIR}/lib/"
 echo "   Headers: ${OUTPUT_DIR}/include/"
 echo ""
-echo "Add to Xcode Build Settings:"
-echo "  Header Search Paths: ${OUTPUT_DIR}/include"
-echo "  Library Search Paths: ${OUTPUT_DIR}/lib"
-echo "  Other Linker Flags: -lmtp-ng-static -framework IOKit -framework CoreFoundation"
+echo "NextAFT.xcodeproj is already configured to use this library."

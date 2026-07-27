@@ -25,6 +25,13 @@ private func usbDeviceNotificationCallback(
     }
 }
 
+nonisolated private struct USBDeviceStatus: Sendable {
+    let isConnected: Bool
+    let name: String?
+    let vendorID: UInt16?
+    let productID: UInt16?
+}
+
 @MainActor
 final class USBDeviceDetector: ObservableObject {
     let objectWillChange = PassthroughSubject<Void, Never>()
@@ -41,7 +48,7 @@ final class USBDeviceDetector: ObservableObject {
 
 
     /// Android 设备的 Vendor ID 列表（常见厂商）
-    static let androidVendorIDs: Set<UInt16> = [
+    nonisolated static let androidVendorIDs: Set<UInt16> = [
         0x18D1, // Google
         0x04E8, // Samsung
         0x2717, // Xiaomi
@@ -152,7 +159,7 @@ final class USBDeviceDetector: ObservableObject {
 
     /// Scan all USB devices and check if any Android device is connected
     nonisolated func refreshDeviceStatus() {
-        var matching = IOServiceMatching(kIOUSBDeviceClassName)
+        let matching = IOServiceMatching(kIOUSBDeviceClassName)
         var iterator: io_iterator_t = 0
 
         let result = IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator)
@@ -175,7 +182,7 @@ final class USBDeviceDetector: ObservableObject {
                 service = IOIteratorNext(iterator)
                 continue
             }
-            let vendorID = vendorProp.takeUnretainedValue() as? Int ?? 0
+            let vendorID = vendorProp.takeRetainedValue() as? Int ?? 0
 
             // Check if this is a known Android vendor
             let vid = UInt16(vendorID)
@@ -187,14 +194,14 @@ final class USBDeviceDetector: ObservableObject {
                 if let productProp = IORegistryEntryCreateCFProperty(
                     service, "idProduct" as CFString, kCFAllocatorDefault, 0
                 ) {
-                    foundPID = UInt16(productProp.takeUnretainedValue() as? Int ?? 0)
+                    foundPID = UInt16(productProp.takeRetainedValue() as? Int ?? 0)
                 }
 
                 // Read product name
                 if let nameProp = IORegistryEntryCreateCFProperty(
                     service, "USB Product Name" as CFString, kCFAllocatorDefault, 0
                 ) {
-                    foundName = nameProp.takeUnretainedValue() as? String
+                    foundName = nameProp.takeRetainedValue() as? String
                 }
 
                 // Found one — stop scanning (first match wins)
@@ -204,17 +211,24 @@ final class USBDeviceDetector: ObservableObject {
             service = IOIteratorNext(iterator)
         }
 
+        let status = USBDeviceStatus(
+            isConnected: foundDevice,
+            name: foundName,
+            vendorID: foundVID,
+            productID: foundPID
+        )
+
         // Update state on main actor
         Task { @MainActor in
-            self.isDeviceConnected = foundDevice
-            self.connectedDeviceName = foundName
-            self.connectedVendorID = foundVID
-            self.connectedProductID = foundPID
+            self.isDeviceConnected = status.isConnected
+            self.connectedDeviceName = status.name
+            self.connectedVendorID = status.vendorID
+            self.connectedProductID = status.productID
 
-            if foundDevice {
-                print("[USB] Android device found: \(foundName ?? "unknown") "
-                    + "(VID: \(String(format: "0x%04X", foundVID ?? 0)), "
-                    + "PID: \(String(format: "0x%04X", foundPID ?? 0)))")
+            if status.isConnected {
+                print("[USB] Android device found: \(status.name ?? "unknown") "
+                    + "(VID: \(String(format: "0x%04X", status.vendorID ?? 0)), "
+                    + "PID: \(String(format: "0x%04X", status.productID ?? 0)))")
             }
         }
     }

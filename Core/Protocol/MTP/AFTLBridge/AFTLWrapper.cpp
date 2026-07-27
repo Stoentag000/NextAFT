@@ -2,472 +2,849 @@
 //  AFTLWrapper.cpp
 //  NextAFT
 //
-//  C++ implementation of the AFTL bridge.
-//  Links against libmtp-ng-static (android-file-transfer-linux).
+//  C++ implementation of the C bridge around android-file-transfer-linux.
 //
 
 #include "AFTLWrapper.h"
 
-// Use relative paths pointing directly to the AFTL submodule source.
-// Do NOT add Vendor/aftl-output/include to Header Search Paths —
-// the C++ headers will break Xcode's Clang module scanner.
-#include "../../../../Vendor/aftl/mtp/ptp/Device.h"
-#include "../../../../Vendor/aftl/mtp/ptp/Session.h"
-#include "../../../../Vendor/aftl/mtp/usb/BulkPipe.h"
-#include "../../../../Vendor/aftl/mtp/ByteArray.h"
-#include "../../../../Vendor/aftl/mtp/log.h"
+#include <mtp/ptp/Device.h>
+#include <mtp/ptp/ObjectFormat.h>
+#include <mtp/ptp/ObjectProperty.h>
+#include <mtp/ptp/Session.h>
+#include <usb/Context.h>
 
-#include <string>
-#include <vector>
-#include <unordered_map>
-#include <mutex>
-#include <cstring>
-#include <cstdlib>
+#include <algorithm>
+#include <chrono>
+#include <cerrno>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
-#include <functional>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
-// ---------------------------------------------------------------------------
-// Internal session state
-// ---------------------------------------------------------------------------
-struct AFTLSession {
-    mtp::usb::ContextPtr      usb_context;
-    mtp::DevicePtr            device;
-    mtp::SessionPtr           session;
-    mtp::StorageId            storage_id;
-    uint32_t                  root_object_id;   // typically 0 (Storage Root)
+namespace {
 
-    // Path → ObjectId cache for fast lookups
-    std::unordered_map<std::string, uint32_t> path_cache;
-    std::mutex                                cache_mutex;
+using ProgressCallback = void (*)(double, void *);
+using CancellationCallback = bool (*)(void *);
 
-    // Canonical root path on device
-    std::string root_path = "/storage/emulated/0";
-};
+thread_local std::string last_error;
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-static char *dup_string(const std::string &s) {
-    char *p = static_cast<char *>(std::malloc(s.size() + 1));
-    if (p) {
-        std::memcpy(p, s.c_str(), s.size() + 1);
-    }
-    return p;
+void clear_error() {
+    last_error.clear();
 }
 
-static std::vector<std::string> split_path(const std::string &path) {
+void set_error(const std::string &message) {
+    last_error = message;
+    std::fprintf(stderr, "AFTL: %s\n", message.c_str());
+}
+
+char *duplicate_string(const std::string &value) {
+    auto *result = static_cast<char *>(std::malloc(value.size() + 1));
+    if (result != nullptr) {
+        std::memcpy(result, value.c_str(), value.size() + 1);
+    }
+    return result;
+}
+
+std::vector<std::string> split_path(const std::string &path) {
     std::vector<std::string> parts;
     std::string part;
-    for (size_t i = 0; i < path.size(); ++i) {
-        if (path[i] == '/') {
+    for (char character : path) {
+        if (character == '/') {
             if (!part.empty()) {
-                parts.push_back(part);
+                parts.push_back(std::move(part));
                 part.clear();
             }
         } else {
-            part += path[i];
+            part.push_back(character);
         }
     }
     if (!part.empty()) {
-        parts.push_back(part);
+        parts.push_back(std::move(part));
     }
     return parts;
 }
 
-// ---------------------------------------------------------------------------
-// Path resolution with cache
-// ---------------------------------------------------------------------------
-
-static uint32_t resolve_child(AFTLSession *s, uint32_t parent_id,
-                              const std::string &child_name) {
-    auto handles = s->session->GetObjectHandles(
-        s->storage_id, mtp::ObjectFormat::Any, parent_id);
-
-    for (auto id : handles.ObjectHandles) {
-        auto info = s->session->GetObjectInfo(id);
-        if (info.Filename == child_name) {
-            return id;
-        }
+std::string normalize_path(const std::string &path) {
+    if (path.empty() || path == "/") {
+        return "/";
     }
-    return 0; // not found
+
+    std::string normalized;
+    for (const auto &part : split_path(path)) {
+        if (part == ".") {
+            continue;
+        }
+        normalized += "/" + part;
+    }
+    return normalized.empty() ? "/" : normalized;
 }
 
-// ---------------------------------------------------------------------------
-// Exported C functions
-// ---------------------------------------------------------------------------
+std::string join_path(const std::string &parent, const std::string &name) {
+    if (parent.empty() || parent == "/") {
+        return "/" + name;
+    }
+    return parent + "/" + name;
+}
+
+class ProgressReporter {
+public:
+    ProgressReporter(mtp::u64 total, ProgressCallback callback, void *userdata)
+        : total_(total), callback_(callback), userdata_(userdata) {}
+
+    void advance(mtp::u64 amount) {
+        current_ += amount;
+        if (callback_ == nullptr || total_ == 0) {
+            return;
+        }
+
+        const double progress = std::min(1.0,
+            static_cast<double>(current_) / static_cast<double>(total_));
+        // AFTL can call the stream for very small USB packets. Limit callbacks
+        // to 0.1% increments so Swift does not enqueue thousands of UI updates.
+        if (progress >= last_reported_ + 0.001 || progress >= 1.0) {
+            last_reported_ = progress;
+            callback_(progress, userdata_);
+        }
+    }
+
+    void finish() {
+        if (callback_ != nullptr && last_reported_ < 1.0) {
+            last_reported_ = 1.0;
+            callback_(1.0, userdata_);
+        }
+    }
+
+private:
+    mtp::u64 total_ = 0;
+    mtp::u64 current_ = 0;
+    double last_reported_ = -1.0;
+    ProgressCallback callback_ = nullptr;
+    void *userdata_ = nullptr;
+};
+
+class CancellationChecker {
+public:
+    CancellationChecker(CancellationCallback callback, void *userdata)
+        : callback_(callback), userdata_(userdata) {}
+
+    void check() const {
+        if (callback_ != nullptr && callback_(userdata_)) {
+            throw mtp::OperationCancelledException();
+        }
+    }
+
+private:
+    CancellationCallback callback_ = nullptr;
+    void *userdata_ = nullptr;
+};
+
+class FileInputStream final :
+    public mtp::IObjectInputStream,
+    public mtp::CancellableStream {
+public:
+    FileInputStream(const std::string &path, ProgressCallback callback,
+                    void *progress_userdata,
+                    CancellationCallback cancellation_callback,
+                    void *cancellation_userdata)
+        : file_(path, std::ios::binary | std::ios::ate),
+          reporter_(file_size(file_, path), callback, progress_userdata),
+          cancellation_(cancellation_callback, cancellation_userdata) {
+        size_ = static_cast<mtp::u64>(file_.tellg());
+        file_.seekg(0, std::ios::beg);
+        if (!file_) {
+            throw std::runtime_error("cannot seek local file: " + path);
+        }
+    }
+
+    mtp::u64 GetSize() const override {
+        return size_;
+    }
+
+    size_t Read(mtp::u8 *data, size_t size) override {
+        cancellation_.check();
+        CheckCancelled();
+        file_.read(reinterpret_cast<char *>(data),
+                   static_cast<std::streamsize>(size));
+        const auto count = file_.gcount();
+        if (file_.bad()) {
+            throw std::runtime_error("failed to read local file");
+        }
+        reporter_.advance(static_cast<mtp::u64>(count));
+        return static_cast<size_t>(count);
+    }
+
+    void finish() {
+        reporter_.finish();
+    }
+
+private:
+    static std::streampos file_size(std::ifstream &file,
+                                    const std::string &path) {
+        if (!file.is_open()) {
+            throw std::runtime_error("cannot open local file: " + path);
+        }
+        const auto size = file.tellg();
+        if (size < 0) {
+            throw std::runtime_error("cannot determine local file size: " + path);
+        }
+        return size;
+    }
+
+    std::ifstream file_;
+    mtp::u64 size_ = 0;
+    ProgressReporter reporter_;
+    CancellationChecker cancellation_;
+};
+
+class FileOutputStream final :
+    public mtp::IObjectOutputStream,
+    public mtp::CancellableStream {
+public:
+    FileOutputStream(const std::string &path, mtp::u64 total,
+                     ProgressCallback callback, void *progress_userdata,
+                     CancellationCallback cancellation_callback,
+                     void *cancellation_userdata)
+        : file_(path, std::ios::binary | std::ios::trunc),
+          reporter_(total, callback, progress_userdata),
+          cancellation_(cancellation_callback, cancellation_userdata) {
+        if (!file_.is_open()) {
+            throw std::runtime_error("cannot create local file: " + path);
+        }
+    }
+
+    size_t Write(const mtp::u8 *data, size_t size) override {
+        cancellation_.check();
+        CheckCancelled();
+        file_.write(reinterpret_cast<const char *>(data),
+                    static_cast<std::streamsize>(size));
+        if (!file_) {
+            throw std::runtime_error("failed to write local file");
+        }
+        reporter_.advance(static_cast<mtp::u64>(size));
+        return size;
+    }
+
+    void close() {
+        file_.flush();
+        if (!file_) {
+            throw std::runtime_error("failed to flush local file");
+        }
+        file_.close();
+    }
+
+    void finish() {
+        reporter_.finish();
+    }
+
+private:
+    std::ofstream file_;
+    ProgressReporter reporter_;
+    CancellationChecker cancellation_;
+};
+
+} // namespace
+
+struct AFTLSession {
+    mtp::usb::ContextPtr usb_context;
+    mtp::DevicePtr device;
+    mtp::SessionPtr session;
+    mtp::StorageId storage_id;
+    mtp::ObjectId root_object_id = mtp::Session::Root;
+
+    // A Session serializes its transactions internally. This additional lock
+    // also keeps cache mutations and multi-transaction path operations atomic.
+    std::recursive_mutex operation_mutex;
+    std::mutex active_transfer_mutex;
+    uint64_t active_transfer_id = 0;
+    std::unordered_map<std::string, mtp::ObjectId> path_cache;
+
+    // MTP exposes a storage/object hierarchy, not Android filesystem paths.
+    // The app keeps this familiar path as a UI alias for the selected storage.
+    const std::string root_path = "/storage/emulated/0";
+};
+
+namespace {
+
+class ActiveTransferGuard {
+public:
+    ActiveTransferGuard(AFTLSession *state, uint64_t transfer_id,
+                        CancellationCallback cancellation_callback,
+                        void *cancellation_userdata)
+        : state_(state), transfer_id_(transfer_id),
+          cancellation_(cancellation_callback, cancellation_userdata) {
+        if (transfer_id_ == 0) {
+            throw std::invalid_argument("transfer ID must not be zero");
+        }
+        std::lock_guard<std::mutex> lock(state_->active_transfer_mutex);
+        if (state_->active_transfer_id != 0) {
+            throw std::runtime_error("another MTP transfer is already active");
+        }
+        state_->active_transfer_id = transfer_id_;
+    }
+
+    ~ActiveTransferGuard() {
+        std::lock_guard<std::mutex> lock(state_->active_transfer_mutex);
+        if (state_->active_transfer_id == transfer_id_) {
+            state_->active_transfer_id = 0;
+        }
+    }
+
+    ActiveTransferGuard(const ActiveTransferGuard &) = delete;
+    ActiveTransferGuard &operator=(const ActiveTransferGuard &) = delete;
+
+    void check_cancellation() const {
+        cancellation_.check();
+    }
+
+private:
+    AFTLSession *state_;
+    uint64_t transfer_id_;
+    CancellationChecker cancellation_;
+};
+
+bool relative_components(AFTLSession *state, const std::string &path,
+                         std::vector<std::string> &components) {
+    const std::string normalized = normalize_path(path);
+    if (normalized == "/" || normalized == state->root_path) {
+        components.clear();
+        return true;
+    }
+
+    const std::string prefix = state->root_path + "/";
+    if (normalized.compare(0, prefix.size(), prefix) != 0) {
+        set_error("path is outside the selected MTP storage: " + normalized);
+        return false;
+    }
+
+    components = split_path(normalized.substr(prefix.size()));
+    if (std::find(components.begin(), components.end(), "..") != components.end()) {
+        set_error("parent path components are not allowed");
+        return false;
+    }
+    return true;
+}
+
+bool resolve_child(AFTLSession *state, mtp::ObjectId parent,
+                   const std::string &child_name, mtp::ObjectId &result) {
+    const auto handles = state->session->GetObjectHandles(
+        state->storage_id, mtp::ObjectFormat::Any, parent);
+    for (const auto id : handles.ObjectHandles) {
+        const auto info = state->session->GetObjectInfo(id);
+        if (info.Filename == child_name) {
+            result = id;
+            return true;
+        }
+    }
+    return false;
+}
+
+int resolve_path_locked(AFTLSession *state, const std::string &path,
+                        mtp::ObjectId &result) {
+    const std::string normalized = normalize_path(path);
+    const auto cached = state->path_cache.find(normalized);
+    if (cached != state->path_cache.end()) {
+        result = cached->second;
+        return 0;
+    }
+
+    std::vector<std::string> components;
+    if (!relative_components(state, normalized, components)) {
+        return -2;
+    }
+
+    mtp::ObjectId current = state->root_object_id;
+    std::string accumulated = state->root_path;
+    for (const auto &component : components) {
+        const std::string next_path = join_path(accumulated, component);
+        const auto next_cached = state->path_cache.find(next_path);
+        if (next_cached != state->path_cache.end()) {
+            current = next_cached->second;
+            accumulated = next_path;
+            continue;
+        }
+
+        mtp::ObjectId child;
+        if (!resolve_child(state, current, component, child)) {
+            set_error("MTP object not found: " + next_path);
+            return -2;
+        }
+        current = child;
+        accumulated = next_path;
+        state->path_cache[accumulated] = current;
+    }
+
+    result = current;
+    return 0;
+}
+
+mtp::u64 object_size(AFTLSession *state, mtp::ObjectId object_id,
+                     const mtp::msg::ObjectInfo &info) {
+    if (info.ObjectCompressedSize != mtp::MaxObjectSize) {
+        return info.ObjectCompressedSize;
+    }
+    try {
+        return state->session->GetObjectIntegerProperty(
+            object_id, mtp::ObjectProperty::ObjectSize);
+    } catch (const std::exception &) {
+        return info.ObjectCompressedSize;
+    }
+}
+
+void cache_child(AFTLSession *state, mtp::ObjectId parent,
+                 const std::string &name, mtp::ObjectId child) {
+    std::vector<std::string> parent_paths;
+    for (const auto &entry : state->path_cache) {
+        if (entry.second == parent) {
+            parent_paths.push_back(entry.first);
+        }
+    }
+    for (const auto &parent_path : parent_paths) {
+        state->path_cache[join_path(parent_path, name)] = child;
+    }
+}
+
+void invalidate_object(AFTLSession *state, mtp::ObjectId object_id) {
+    std::vector<std::string> prefixes;
+    for (const auto &entry : state->path_cache) {
+        if (entry.second == object_id) {
+            prefixes.push_back(entry.first);
+        }
+    }
+
+    for (auto iterator = state->path_cache.begin();
+         iterator != state->path_cache.end();) {
+        bool erase = iterator->second == object_id;
+        for (const auto &prefix : prefixes) {
+            if (iterator->first.compare(0, prefix.size(), prefix) == 0 &&
+                (iterator->first.size() == prefix.size() ||
+                 iterator->first[prefix.size()] == '/')) {
+                erase = true;
+                break;
+            }
+        }
+        if (erase) {
+            iterator = state->path_cache.erase(iterator);
+        } else {
+            ++iterator;
+        }
+    }
+}
+
+} // namespace
 
 extern "C" {
 
+const char *aftl_last_error(void) {
+    return last_error.c_str();
+}
+
 AFTLSessionRef aftl_connect(void) {
-    auto *s = new AFTLSession();
+    clear_error();
+    auto state = std::make_unique<AFTLSession>();
 
     try {
-        // Create USB context and find first MTP device
-        s->usb_context = mtp::usb::Context::Create();
-        s->device = mtp::Device::FindFirst(s->usb_context);
-        if (!s->device) {
-            delete s;
+        state->usb_context = std::make_shared<mtp::usb::Context>();
+        state->device = mtp::Device::FindFirst(state->usb_context);
+        if (!state->device) {
+            set_error("no MTP device found; unlock the device and select File Transfer");
             return nullptr;
         }
 
-        // Open MTP session (session ID 1 is conventional)
-        s->session = s->device->OpenSession(1);
-        if (!s->session) {
-            delete s;
+        state->session = state->device->OpenSession(1);
+        if (!state->session) {
+            set_error("failed to open MTP session");
             return nullptr;
         }
 
-        // Enumerate storages and pick the first one
-        auto storages = s->session->GetStorageIds();
-        if (storages.StorageIds.empty()) {
-            delete s;
+        const auto storages = state->session->GetStorageIDs();
+        if (storages.StorageIDs.empty()) {
+            set_error("the MTP device exposes no storage");
             return nullptr;
         }
-        s->storage_id = storages.StorageIds.front();
-        s->root_object_id = 0; // MTP storage root
+        state->storage_id = storages.StorageIDs.front();
+        state->path_cache[state->root_path] = state->root_object_id;
+        state->path_cache["/"] = state->root_object_id;
 
-        // Cache root path
-        {
-            std::lock_guard<std::mutex> lock(s->cache_mutex);
-            s->path_cache[s->root_path] = s->root_object_id;
-            s->path_cache["/"] = s->root_object_id;
-        }
-
-        return static_cast<AFTLSessionRef>(s);
-
-    } catch (const std::exception &e) {
-        fprintf(stderr, "AFTL connect failed: %s\n", e.what());
-        delete s;
+        return static_cast<AFTLSessionRef>(state.release());
+    } catch (const std::exception &error) {
+        set_error(std::string("connect failed: ") + error.what());
         return nullptr;
     }
 }
 
 void aftl_disconnect(AFTLSessionRef handle) {
-    if (!handle) return;
-    auto *s = static_cast<AFTLSession *>(handle);
-    // Session and Device are ref-counted, releasing the pointer is enough
-    s->session.reset();
-    s->device.reset();
-    s->usb_context.reset();
-    delete s;
+    clear_error();
+    if (!handle) {
+        return;
+    }
+    auto *state = static_cast<AFTLSession *>(handle);
+    {
+        std::lock_guard<std::recursive_mutex> lock(state->operation_mutex);
+        state->session.reset();
+        state->device.reset();
+        state->usb_context.reset();
+        state->path_cache.clear();
+    }
+    delete state;
 }
 
 bool aftl_is_connected(AFTLSessionRef handle) {
-    return handle != nullptr;
+    if (!handle) {
+        return false;
+    }
+    auto *state = static_cast<AFTLSession *>(handle);
+    std::lock_guard<std::recursive_mutex> lock(state->operation_mutex);
+    return state->session != nullptr;
 }
 
-// ---------------------------------------------------------------------------
-// Device info
-// ---------------------------------------------------------------------------
-
 AFTLDeviceInfo aftl_get_device_info(AFTLSessionRef handle) {
-    AFTLDeviceInfo info = {};
-    if (!handle) return info;
-    auto *s = static_cast<AFTLSession *>(handle);
+    clear_error();
+    AFTLDeviceInfo result = {};
+    if (!handle) {
+        set_error("device is not connected");
+        return result;
+    }
+    auto *state = static_cast<AFTLSession *>(handle);
+    std::lock_guard<std::recursive_mutex> lock(state->operation_mutex);
 
     try {
-        auto dev_info = s->session->GetDeviceInfo();
-        info.manufacturer = dup_string(dev_info.Manufacturer);
-        info.model        = dup_string(dev_info.Model);
-        info.serial       = dup_string(dev_info.SerialNumber);
+        const auto &device_info = state->session->GetDeviceInfo();
+        result.manufacturer = duplicate_string(device_info.Manufacturer);
+        result.model = duplicate_string(device_info.Model);
+        result.serial = duplicate_string(device_info.SerialNumber);
+        if (!result.manufacturer || !result.model || !result.serial) {
+            throw std::bad_alloc();
+        }
 
-        // Build storage description
-        auto si = s->session->GetStorageInfo(s->storage_id);
-        char buf[128];
-        uint64_t total = si.MaxCapacity;
-        uint64_t free_space = si.FreeSpaceInBytes;
-        snprintf(buf, sizeof(buf), "%.1f GB, %.1f GB free",
-                 total / 1073741824.0, free_space / 1073741824.0);
-        info.storage_description = dup_string(buf);
+        const auto storage_info = state->session->GetStorageInfo(state->storage_id);
+        result.storage_total = storage_info.MaxCapacity;
+        result.storage_free = storage_info.FreeSpaceInBytes;
 
-    } catch (const std::exception &e) {
-        fprintf(stderr, "AFTL get_device_info failed: %s\n", e.what());
+        char description[128];
+        std::snprintf(description, sizeof(description), "%.1f GB, %.1f GB free",
+                      result.storage_total / 1073741824.0,
+                      result.storage_free / 1073741824.0);
+        result.storage_description = duplicate_string(description);
+        if (!result.storage_description) {
+            throw std::bad_alloc();
+        }
+    } catch (const std::exception &error) {
+        set_error(std::string("get device info failed: ") + error.what());
     }
-    return info;
+    return result;
 }
 
 void aftl_free_device_info(AFTLDeviceInfo *info) {
-    if (!info) return;
-    std::free(info->manufacturer);   info->manufacturer = nullptr;
-    std::free(info->model);          info->model = nullptr;
-    std::free(info->serial);         info->serial = nullptr;
-    std::free(info->storage_description); info->storage_description = nullptr;
+    if (!info) {
+        return;
+    }
+    std::free(info->manufacturer);
+    std::free(info->model);
+    std::free(info->serial);
+    std::free(info->storage_description);
+    *info = {};
 }
-
-// ---------------------------------------------------------------------------
-// Path resolution
-// ---------------------------------------------------------------------------
 
 int aftl_resolve_path(AFTLSessionRef handle, const char *path,
                       uint32_t *object_id) {
-    if (!handle || !path || !object_id) return -1;
-    auto *s = static_cast<AFTLSession *>(handle);
-    std::string p(path);
-
-    // Check cache
-    {
-        std::lock_guard<std::mutex> lock(s->cache_mutex);
-        auto it = s->path_cache.find(p);
-        if (it != s->path_cache.end()) {
-            *object_id = it->second;
-            return 0;
-        }
+    clear_error();
+    if (!handle || !path || !object_id) {
+        set_error("invalid path resolution arguments");
+        return -1;
     }
+    auto *state = static_cast<AFTLSession *>(handle);
+    std::lock_guard<std::recursive_mutex> lock(state->operation_mutex);
 
-    // Walk the path components
-    auto parts = split_path(p);
-    uint32_t current = s->root_object_id;
-    std::string accumulated = s->root_path;
-
-    for (const auto &part : parts) {
-        // Skip if this component matches the root path tail
-        if (accumulated == s->root_path && part == split_path(s->root_path).back()) {
-            continue;
+    try {
+        mtp::ObjectId resolved;
+        const int result = resolve_path_locked(state, path, resolved);
+        if (result == 0) {
+            *object_id = resolved.Id;
         }
-
-        // Check cache for accumulated path
-        std::string next_path = accumulated + "/" + part;
-        {
-            std::lock_guard<std::mutex> lock(s->cache_mutex);
-            auto it = s->path_cache.find(next_path);
-            if (it != s->path_cache.end()) {
-                current = it->second;
-                accumulated = next_path;
-                continue;
-            }
-        }
-
-        // Resolve via MTP
-        uint32_t child = resolve_child(s, current, part);
-        if (child == 0) return -2; // path component not found
-
-        current = child;
-        accumulated = next_path;
-
-        // Cache it
-        {
-            std::lock_guard<std::mutex> lock(s->cache_mutex);
-            s->path_cache[accumulated] = current;
-        }
+        return result;
+    } catch (const std::exception &error) {
+        set_error(std::string("resolve path failed: ") + error.what());
+        return -3;
     }
-
-    *object_id = current;
-    return 0;
 }
 
 uint32_t aftl_get_root_object_id(AFTLSessionRef handle) {
-    if (!handle) return 0;
-    return static_cast<AFTLSession *>(handle)->root_object_id;
+    if (!handle) {
+        return 0;
+    }
+    return static_cast<AFTLSession *>(handle)->root_object_id.Id;
 }
-
-// ---------------------------------------------------------------------------
-// File listing
-// ---------------------------------------------------------------------------
 
 int aftl_list_files(AFTLSessionRef handle, const char *path,
                     AFTLFileList *out) {
-    if (!handle || !path || !out) return -1;
-    auto *s = static_cast<AFTLSession *>(handle);
+    clear_error();
+    if (out) {
+        *out = {};
+    }
+    if (!handle || !path || !out) {
+        set_error("invalid list arguments");
+        return -1;
+    }
+    auto *state = static_cast<AFTLSession *>(handle);
+    std::lock_guard<std::recursive_mutex> lock(state->operation_mutex);
+    std::vector<AFTLFileInfo> files;
 
     try {
-        uint32_t parent_id = 0;
-        if (aftl_resolve_path(handle, path, &parent_id) != 0) {
+        mtp::ObjectId parent_id;
+        if (resolve_path_locked(state, path, parent_id) != 0) {
             return -2;
         }
 
-        auto handles = s->session->GetObjectHandles(
-            s->storage_id, mtp::ObjectFormat::Any, parent_id);
-
-        std::vector<AFTLFileInfo> files;
+        const auto handles = state->session->GetObjectHandles(
+            state->storage_id, mtp::ObjectFormat::Any, parent_id);
         files.reserve(handles.ObjectHandles.size());
+        const std::string normalized_parent = normalize_path(path);
 
-        for (auto id : handles.ObjectHandles) {
-            auto info = s->session->GetObjectInfo(id);
-
-            AFTLFileInfo fi = {};
-            fi.object_id   = id;
-            fi.name         = dup_string(info.Filename);
-            fi.size         = info.ObjectCompressedSize;
-            fi.is_directory = (info.ObjectFormat == mtp::ObjectFormat::Association);
-
-            // Cache the full path for this object
-            std::string child_path =
-                std::string(path) + "/" + info.Filename;
-            {
-                std::lock_guard<std::mutex> lock(s->cache_mutex);
-                s->path_cache[child_path] = id;
+        for (const auto id : handles.ObjectHandles) {
+            const auto info = state->session->GetObjectInfo(id);
+            AFTLFileInfo file = {};
+            file.object_id = id.Id;
+            file.name = duplicate_string(info.Filename);
+            if (!file.name) {
+                throw std::bad_alloc();
             }
-
-            files.push_back(fi);
+            file.is_directory = info.ObjectFormat == mtp::ObjectFormat::Association;
+            file.size = file.is_directory ? 0 : object_size(state, id, info);
+            files.push_back(file);
+            state->path_cache[join_path(normalized_parent, info.Filename)] = id;
         }
 
-        // Transfer ownership to caller
-        out->count = static_cast<int>(files.size());
-        if (out->count > 0) {
+        if (!files.empty()) {
             out->items = static_cast<AFTLFileInfo *>(
                 std::malloc(sizeof(AFTLFileInfo) * files.size()));
+            if (!out->items) {
+                throw std::bad_alloc();
+            }
             std::memcpy(out->items, files.data(),
                         sizeof(AFTLFileInfo) * files.size());
-        } else {
-            out->items = nullptr;
         }
+        out->count = static_cast<int>(files.size());
         return 0;
-
-    } catch (const std::exception &e) {
-        fprintf(stderr, "AFTL list_files failed: %s\n", e.what());
+    } catch (const std::exception &error) {
+        for (auto &file : files) {
+            std::free(file.name);
+            file.name = nullptr;
+        }
+        set_error(std::string("list files failed: ") + error.what());
         return -3;
     }
 }
 
 void aftl_free_file_list(AFTLFileList *list) {
-    if (!list || !list->items) return;
-    for (int i = 0; i < list->count; ++i) {
-        std::free(list->items[i].name);
+    if (!list) {
+        return;
+    }
+    for (int index = 0; index < list->count; ++index) {
+        std::free(list->items[index].name);
     }
     std::free(list->items);
-    list->items = nullptr;
-    list->count = 0;
+    *list = {};
 }
 
-// ---------------------------------------------------------------------------
-// Download
-// ---------------------------------------------------------------------------
+int aftl_cancel_transfer(AFTLSessionRef handle, uint64_t transfer_id) {
+    if (!handle || transfer_id == 0) {
+        return -1;
+    }
+    auto *state = static_cast<AFTLSession *>(handle);
+
+    // A transfer may have published its ID a fraction before Session creates
+    // the transaction. Retry briefly, but always compare the ID under the same
+    // mutex used by the transfer guard so a late cancellation cannot abort the
+    // following queued transfer.
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        std::unique_lock<std::mutex> lock(state->active_transfer_mutex);
+        if (state->active_transfer_id != transfer_id) {
+            return 1;
+        }
+        try {
+            state->session->AbortCurrentTransaction(1000);
+            return 0;
+        } catch (const std::exception &) {
+            lock.unlock();
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+    }
+    return -2;
+}
 
 int aftl_download(AFTLSessionRef handle, uint32_t object_id,
-                  const char *local_path,
-                  void (*progress_cb)(double, void *),
-                  void *userdata) {
-    if (!handle || !local_path) return -1;
-    auto *s = static_cast<AFTLSession *>(handle);
+                  const char *local_path, ProgressCallback progress_cb,
+                  void *progress_userdata,
+                  CancellationCallback cancellation_cb,
+                  void *cancellation_userdata, uint64_t transfer_id) {
+    clear_error();
+    if (!handle || object_id == 0 || !local_path) {
+        set_error("invalid download arguments");
+        return -1;
+    }
+    auto *state = static_cast<AFTLSession *>(handle);
+    std::lock_guard<std::recursive_mutex> lock(state->operation_mutex);
+    const std::string destination(local_path);
+    const std::string partial_path = destination + ".nextaft-part";
+    std::remove(partial_path.c_str());
 
     try {
-        auto info = s->session->GetObjectInfo(object_id);
-        uint64_t total_size = info.ObjectCompressedSize;
-
-        // Use GetPartialObject for chunked download with progress
-        std::ofstream out(local_path, std::ios::binary);
-        if (!out.is_open()) return -2;
-
-        const uint64_t chunk_size = 256 * 1024; // 256 KB chunks
-        uint64_t offset = 0;
-
-        while (offset < total_size) {
-            uint64_t to_read = std::min(chunk_size, total_size - offset);
-            auto data = s->session->GetPartialObject(object_id, offset,
-                                                     static_cast<uint32_t>(to_read));
-            if (data.Size() == 0) break;
-
-            out.write(reinterpret_cast<const char *>(data.Data()), data.Size());
-            offset += data.Size();
-
-            if (progress_cb && total_size > 0) {
-                progress_cb(static_cast<double>(offset) / total_size, userdata);
-            }
+        ActiveTransferGuard transfer(state, transfer_id, cancellation_cb,
+                                     cancellation_userdata);
+        transfer.check_cancellation();
+        const mtp::ObjectId id(object_id);
+        const auto info = state->session->GetObjectInfo(id);
+        if (info.ObjectFormat == mtp::ObjectFormat::Association) {
+            throw std::runtime_error("cannot download a directory as a file");
         }
 
-        out.close();
-        if (progress_cb) progress_cb(1.0, userdata);
-        return 0;
+        auto stream = std::make_shared<FileOutputStream>(
+            partial_path, object_size(state, id, info), progress_cb,
+            progress_userdata, cancellation_cb, cancellation_userdata);
+        transfer.check_cancellation();
+        state->session->GetObject(id, stream);
+        stream->close();
 
-    } catch (const std::exception &e) {
-        fprintf(stderr, "AFTL download failed: %s\n", e.what());
+        if (std::rename(partial_path.c_str(), destination.c_str()) != 0) {
+            throw std::runtime_error(std::string("cannot replace destination file: ") +
+                                     std::strerror(errno));
+        }
+        stream->finish();
+        return 0;
+    } catch (const mtp::OperationCancelledException &) {
+        std::remove(partial_path.c_str());
+        set_error("download cancelled");
+        return -4;
+    } catch (const std::exception &error) {
+        std::remove(partial_path.c_str());
+        set_error(std::string("download failed: ") + error.what());
         return -3;
     }
 }
-
-// ---------------------------------------------------------------------------
-// Upload
-// ---------------------------------------------------------------------------
 
 int aftl_upload(AFTLSessionRef handle, const char *local_path,
-                uint32_t parent_object_id,
-                void (*progress_cb)(double, void *),
-                void *userdata,
+                const char *remote_name, uint32_t parent_object_id,
+                ProgressCallback progress_cb, void *progress_userdata,
+                CancellationCallback cancellation_cb,
+                void *cancellation_userdata, uint64_t transfer_id,
                 uint32_t *new_object_id) {
-    if (!handle || !local_path) return -1;
-    auto *s = static_cast<AFTLSession *>(handle);
+    clear_error();
+    if (new_object_id) {
+        *new_object_id = 0;
+    }
+    if (!handle || !local_path || !remote_name || remote_name[0] == '\0') {
+        set_error("invalid upload arguments");
+        return -1;
+    }
+    auto *state = static_cast<AFTLSession *>(handle);
+    std::lock_guard<std::recursive_mutex> lock(state->operation_mutex);
+    mtp::ObjectId created_id;
+    bool created = false;
 
     try {
-        // Get local file info
-        std::ifstream in(local_path, std::ios::binary | std::ios::ate);
-        if (!in.is_open()) return -2;
-        uint64_t file_size = in.tellg();
-        in.seekg(0);
+        ActiveTransferGuard transfer(state, transfer_id, cancellation_cb,
+                                     cancellation_userdata);
+        transfer.check_cancellation();
+        auto stream = std::make_shared<FileInputStream>(local_path,
+                                                       progress_cb,
+                                                       progress_userdata,
+                                                       cancellation_cb,
+                                                       cancellation_userdata);
+        mtp::msg::ObjectInfo object_info;
+        object_info.Filename = remote_name;
+        object_info.ObjectFormat = mtp::ObjectFormatFromFilename(remote_name);
+        object_info.ObjectCompressedSize = stream->GetSize();
 
-        std::string filename = local_path;
-        auto pos = filename.rfind('/');
-        if (pos != std::string::npos) filename = filename.substr(pos + 1);
+        const mtp::ObjectId parent(parent_object_id);
+        const auto result = state->session->SendObjectInfo(
+            object_info, state->storage_id, parent);
+        created_id = result.ObjectId;
+        created = true;
+        transfer.check_cancellation();
+        state->session->SendObject(stream);
+        stream->finish();
+        cache_child(state, parent, remote_name, created_id);
 
-        // Build ObjectInfo for the new file
-        mtp::msg::ObjectInfo obj_info;
-        obj_info.Filename      = filename;
-        obj_info.ObjectFormat  = mtp::ObjectFormat::Undefined; // let device decide
-        obj_info.StorageId     = s->storage_id;
-        obj_info.ParentObject  = parent_object_id;
-
-        // SendObjectInfo creates the metadata entry
-        auto new_info = s->session->SendObjectInfo(obj_info, s->storage_id,
-                                                    parent_object_id);
-        uint32_t new_id = new_info.ObjectId;
-
-        // Read file into memory (for SendObjectStream)
-        // For large files we'd want streaming, but AFTL's SendObjectStream
-        // takes an IObjectInputStream.  Use ByteArray for now.
-        std::vector<uint8_t> buf(file_size);
-        in.read(reinterpret_cast<char *>(buf.data()), file_size);
-        in.close();
-
-        mtp::ByteArray data(buf.data(), buf.size());
-        auto stream = mtp::IObjectInputStream::Create(data);
-        s->session->SendObject(stream);
-
-        if (progress_cb) progress_cb(1.0, userdata);
-        if (new_object_id) *new_object_id = new_id;
+        if (new_object_id) {
+            *new_object_id = created_id.Id;
+        }
         return 0;
-
-    } catch (const std::exception &e) {
-        fprintf(stderr, "AFTL upload failed: %s\n", e.what());
+    } catch (const mtp::OperationCancelledException &) {
+        if (created) {
+            try {
+                state->session->DeleteObject(created_id);
+            } catch (const std::exception &) {
+                // The transfer remains cancelled even if cleanup fails.
+            }
+        }
+        set_error("upload cancelled");
+        return -4;
+    } catch (const std::exception &error) {
+        if (created) {
+            try {
+                state->session->DeleteObject(created_id);
+            } catch (const std::exception &) {
+                // Preserve the original upload error.
+            }
+        }
+        set_error(std::string("upload failed: ") + error.what());
         return -3;
     }
 }
 
-// ---------------------------------------------------------------------------
-// Delete & Mkdir
-// ---------------------------------------------------------------------------
-
 int aftl_delete(AFTLSessionRef handle, uint32_t object_id) {
-    if (!handle) return -1;
-    auto *s = static_cast<AFTLSession *>(handle);
+    clear_error();
+    if (!handle || object_id == 0 ||
+        object_id == mtp::Session::Root.Id) {
+        set_error("invalid delete arguments");
+        return -1;
+    }
+    auto *state = static_cast<AFTLSession *>(handle);
+    std::lock_guard<std::recursive_mutex> lock(state->operation_mutex);
+
     try {
-        s->session->DeleteObject(object_id);
-        // Remove from cache
-        {
-            std::lock_guard<std::mutex> lock(s->cache_mutex);
-            for (auto it = s->path_cache.begin(); it != s->path_cache.end(); ) {
-                if (it->second == object_id) it = s->path_cache.erase(it);
-                else ++it;
-            }
-        }
+        const mtp::ObjectId id(object_id);
+        state->session->DeleteObject(id);
+        invalidate_object(state, id);
         return 0;
-    } catch (const std::exception &e) {
-        fprintf(stderr, "AFTL delete failed: %s\n", e.what());
+    } catch (const std::exception &error) {
+        set_error(std::string("delete failed: ") + error.what());
         return -2;
     }
 }
 
 int aftl_mkdir(AFTLSessionRef handle, const char *name,
                uint32_t parent_object_id, uint32_t *new_dir_id) {
-    if (!handle || !name) return -1;
-    auto *s = static_cast<AFTLSession *>(handle);
+    clear_error();
+    if (new_dir_id) {
+        *new_dir_id = 0;
+    }
+    if (!handle || !name || name[0] == '\0') {
+        set_error("invalid create-directory arguments");
+        return -1;
+    }
+    auto *state = static_cast<AFTLSession *>(handle);
+    std::lock_guard<std::recursive_mutex> lock(state->operation_mutex);
+
     try {
-        auto info = s->session->CreateDirectory(name, parent_object_id,
-                                                 s->storage_id);
-        if (new_dir_id) *new_dir_id = info.ObjectId;
+        const mtp::ObjectId parent(parent_object_id);
+        const auto result = state->session->CreateDirectory(
+            name, parent, state->storage_id);
+        cache_child(state, parent, name, result.ObjectId);
+        if (new_dir_id) {
+            *new_dir_id = result.ObjectId.Id;
+        }
         return 0;
-    } catch (const std::exception &e) {
-        fprintf(stderr, "AFTL mkdir failed: %s\n", e.what());
+    } catch (const std::exception &error) {
+        set_error(std::string("create directory failed: ") + error.what());
         return -2;
     }
 }
