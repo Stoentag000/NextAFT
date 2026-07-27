@@ -36,6 +36,39 @@ enum TransferDirection {
     case downloadToMac    // Android → Mac
 }
 
+/// 同名文件的处理方式。默认由界面选择，并在任务入队时固定下来。
+enum TransferConflictPolicy: String, CaseIterable, Identifiable {
+    case overwrite
+    case skip
+    case rename
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .overwrite: return "覆盖"
+        case .skip: return "跳过"
+        case .rename: return "自动重命名"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .overwrite: return "doc.on.doc"
+        case .skip: return "forward.end"
+        case .rename: return "pencil"
+        }
+    }
+
+    var help: String {
+        switch self {
+        case .overwrite: return "用传输文件替换同名文件"
+        case .skip: return "保留已有文件，不创建传输任务"
+        case .rename: return "为新文件添加编号以保留两者"
+        }
+    }
+}
+
 enum TransferStatus: Equatable {
     case pending
     case inProgress

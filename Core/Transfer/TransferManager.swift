@@ -18,6 +18,7 @@ final class TransferManager: ObservableObject {
     private struct QueueItem {
         let task: TransferTask
         let device: DeviceProtocol
+        let overwrite: Bool
         let cancellation: TransferCancellationToken
     }
 
@@ -29,6 +30,7 @@ final class TransferManager: ObservableObject {
 
     private var taskQueue: [QueueItem] = []
     private var activeTransfers: [UUID: ActiveTransfer] = [:]
+    var onTaskFinished: ((TransferTask, DeviceProtocol) -> Void)?
     
     /// 添加下载任务（手机 → Mac）
     func enqueueDownload(
@@ -49,6 +51,7 @@ final class TransferManager: ObservableObject {
         taskQueue.append(QueueItem(
             task: task,
             device: device,
+            overwrite: true,
             cancellation: TransferCancellationToken()
         ))
         processQueue()
@@ -58,9 +61,10 @@ final class TransferManager: ObservableObject {
     func enqueueUpload(
         localURL: URL,
         remotePath: String,
+        overwrite: Bool,
         device: DeviceProtocol
     ) {
-        let fileName = localURL.lastPathComponent
+        let fileName = URL(fileURLWithPath: remotePath).lastPathComponent
         let fileSize = (try? FileManager.default.attributesOfItem(atPath: localURL.path)[.size] as? UInt64) ?? 0
         
         let task = TransferTask(
@@ -74,6 +78,7 @@ final class TransferManager: ObservableObject {
         taskQueue.append(QueueItem(
             task: task,
             device: device,
+            overwrite: overwrite,
             cancellation: TransferCancellationToken()
         ))
         processQueue()
@@ -121,6 +126,7 @@ final class TransferManager: ObservableObject {
                 try await item.device.upload(
                     from: URL(fileURLWithPath: task.sourcePath),
                     to: task.destinationPath,
+                    overwrite: item.overwrite,
                     progress: progressHandler,
                     cancellation: item.cancellation
                 )
@@ -147,6 +153,9 @@ final class TransferManager: ObservableObject {
 
         activeTransfers.removeValue(forKey: task.id)
         activeTaskCount = activeTransfers.count
+        if let finishedTask = tasks.first(where: { $0.id == task.id }) {
+            onTaskFinished?(finishedTask, item.device)
+        }
         processQueue()
     }
     
@@ -190,6 +199,9 @@ final class TransferManager: ObservableObject {
 
         tasks[index].status = .cancelled
         tasks[index].endDate = Date()
+        if let queuedDevice = queued.first?.device {
+            onTaskFinished?(tasks[index], queuedDevice)
+        }
         processQueue()
     }
     

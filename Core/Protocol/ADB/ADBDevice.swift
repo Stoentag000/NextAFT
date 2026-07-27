@@ -344,6 +344,7 @@ final class ADBDevice: DeviceProtocol {
     }
     
     func upload(from localURL: URL, to remotePath: String,
+                overwrite: Bool,
                 progress: @escaping (Double) -> Void,
                 cancellation: TransferCancellationToken) async throws {
         guard isConnected, let deviceId else { throw DeviceError.notConnected }
@@ -357,9 +358,18 @@ final class ADBDevice: DeviceProtocol {
                 cancellation: cancellation
             )
             try cancellation.checkCancellation()
+            let commitCommand: String
+            if overwrite {
+                commitCommand = "mv -f -- \(ADBShellProtocol.quote(partialPath)) "
+                    + ADBShellProtocol.quote(remotePath)
+            } else {
+                let destination = ADBShellProtocol.quote(remotePath)
+                commitCommand = "if [ -e \(destination) ] || [ -L \(destination) ]; then "
+                    + "printf '%s\\n' 'destination already exists' >&2; exit 1; fi; "
+                    + "mv -- \(ADBShellProtocol.quote(partialPath)) \(destination)"
+            }
             _ = try await runADB([
-                "-s", deviceId, "shell",
-                "mv -f -- \(ADBShellProtocol.quote(partialPath)) \(ADBShellProtocol.quote(remotePath))"
+                "-s", deviceId, "shell", commitCommand
             ], cancellation: cancellation)
         } catch {
             _ = try? await runADB([
@@ -371,22 +381,12 @@ final class ADBDevice: DeviceProtocol {
     
     func deleteFile(at path: String) async throws {
         guard isConnected, let deviceId else { throw DeviceError.notConnected }
-        
-        // 先判断是文件还是目录
-        let statOutput = try await runADB([
-            "-s", deviceId, "shell", "stat -c %F -- \(ADBShellProtocol.quote(path))"
-        ])
-        let isDir = statOutput.trimmingCharacters(in: .whitespacesAndNewlines).contains("directory")
-        
-        if isDir {
-            _ = try await runADB([
-                "-s", deviceId, "shell", "rm -rf -- \(ADBShellProtocol.quote(path))"
-            ])
-        } else {
-            _ = try await runADB([
-                "-s", deviceId, "shell", "rm -- \(ADBShellProtocol.quote(path))"
-            ])
-        }
+
+        let quotedPath = ADBShellProtocol.quote(path)
+        let command = "if [ ! -e \(quotedPath) ] && [ ! -L \(quotedPath) ]; then "
+            + "printf '%s\\n' 'file does not exist' >&2; exit 1; fi; "
+            + "rm -rf -- \(quotedPath)"
+        _ = try await runADB(["-s", deviceId, "shell", command])
     }
     
     func createDirectory(at path: String) async throws {

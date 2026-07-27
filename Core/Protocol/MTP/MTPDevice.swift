@@ -177,6 +177,7 @@ nonisolated private final class MTPWorker: @unchecked Sendable {
     }
 
     func upload(from localPath: String, to remotePath: String,
+                overwrite: Bool,
                 progress: @escaping (Double) -> Void,
                 cancellation: TransferCancellationToken) async throws {
         let callbackBox = MTPTransferCallbackBox(
@@ -194,6 +195,27 @@ nonisolated private final class MTPWorker: @unchecked Sendable {
             guard !remoteName.isEmpty,
                   aftl_resolve_path(handle, parentPath, &parentID) == 0 else {
                 throw bridgeError(fallback: "MTP 目标目录不存在：\(parentPath)")
+            }
+
+            // MTP does not define portable replace-on-upload semantics. Keep
+            // the lookup, optional delete and upload on this worker queue so
+            // another MTP operation cannot interleave between them.
+            var existingObjectID: UInt32 = 0
+            let destinationExists = aftl_resolve_path(
+                handle,
+                remotePath,
+                &existingObjectID
+            ) == 0 && existingObjectID != 0
+            if destinationExists {
+                guard overwrite else {
+                    throw MTPBridgeError(message: "MTP 目标文件已存在：\(remotePath)")
+                }
+                guard FileManager.default.isReadableFile(atPath: localPath) else {
+                    throw MTPBridgeError(message: "本地文件不可读：\(localPath)")
+                }
+                guard aftl_delete(handle, existingObjectID) == 0 else {
+                    throw bridgeError(fallback: "无法覆盖 MTP 文件：\(remotePath)")
+                }
             }
 
             let transferID = makeTransferID()
@@ -397,9 +419,11 @@ final class MTPDevice: DeviceProtocol {
     }
 
     func upload(from localURL: URL, to remotePath: String,
+                overwrite: Bool,
                 progress: @escaping (Double) -> Void,
                 cancellation: TransferCancellationToken) async throws {
         try await worker.upload(from: localURL.path, to: remotePath,
+                                overwrite: overwrite,
                                 progress: progress,
                                 cancellation: cancellation)
     }

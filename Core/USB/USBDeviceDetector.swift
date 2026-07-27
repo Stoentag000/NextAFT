@@ -25,7 +25,7 @@ private func usbDeviceNotificationCallback(
     }
 }
 
-nonisolated private struct USBDeviceStatus: Sendable {
+nonisolated struct USBDeviceStatus: Sendable, Equatable {
     let isConnected: Bool
     let name: String?
     let vendorID: UInt16?
@@ -40,12 +40,12 @@ final class USBDeviceDetector: ObservableObject {
     var connectedDeviceName: String? { willSet { objectWillChange.send() } }
     var connectedVendorID: UInt16? { willSet { objectWillChange.send() } }
     var connectedProductID: UInt16? { willSet { objectWillChange.send() } }
+    var onStatusChange: ((USBDeviceStatus) -> Void)?
 
     private var notifyPort: IONotificationPortRef?
     private var addedIterator: io_iterator_t = 0
     private var removedIterator: io_iterator_t = 0
-
-
+    private var isMonitoring = false
 
     /// Android 设备的 Vendor ID 列表（常见厂商）
     nonisolated static let androidVendorIDs: Set<UInt16> = [
@@ -57,19 +57,29 @@ final class USBDeviceDetector: ObservableObject {
         0x19D2, // ZTE
         0x10A9, // LG
         0x0FCE, // Sony
+        0x22B8, // Motorola
+        0x0B05, // ASUS
+        0x0502, // Acer
+        0x0955, // NVIDIA
+        0x1949, // Amazon
         0x2A70, // OnePlus
         0x2D95, // OPPO
         0x2A45, // Meizu
         0x0489, // Foxconn (various)
-        0x2717, // Xiaomi (duplicate for safety)
         0x17EF, // Lenovo
         0x0E8D, // MediaTek (many Chinese brands)
         0x2C02, // Realme
+        0x2E04, // HMD / Nokia
     ]
 
     // MARK: - Lifecycle
 
     func startMonitoring() {
+        guard !isMonitoring else {
+            refreshDeviceStatus()
+            return
+        }
+
         // Get a reference to self as raw pointer for the callback
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
 
@@ -98,6 +108,7 @@ final class USBDeviceDetector: ObservableObject {
 
         if addResult != kIOReturnSuccess {
             print("[USB] Failed to add matching notification: \(addResult)")
+            stopMonitoring()
             return
         }
 
@@ -121,6 +132,7 @@ final class USBDeviceDetector: ObservableObject {
 
         if removeResult != kIOReturnSuccess {
             print("[USB] Failed to add terminated notification: \(removeResult)")
+            stopMonitoring()
             return
         }
 
@@ -131,11 +143,14 @@ final class USBDeviceDetector: ObservableObject {
         }
 
         // Do an initial check
+        isMonitoring = true
         refreshDeviceStatus()
         print("[USB] Monitoring started")
     }
 
     func stopMonitoring() {
+        guard isMonitoring || notifyPort != nil else { return }
+        isMonitoring = false
         if addedIterator != 0 {
             IOObjectRelease(addedIterator)
             addedIterator = 0
@@ -152,6 +167,8 @@ final class USBDeviceDetector: ObservableObject {
         }
         isDeviceConnected = false
         connectedDeviceName = nil
+        connectedVendorID = nil
+        connectedProductID = nil
         print("[USB] Monitoring stopped")
     }
 
@@ -173,11 +190,12 @@ final class USBDeviceDetector: ObservableObject {
 
         var service = IOIteratorNext(iterator)
         while service != 0 {
-            defer { IOObjectRelease(service) }
+            let currentService = service
+            defer { IOObjectRelease(currentService) }
 
             // Read vendor ID
             guard let vendorProp = IORegistryEntryCreateCFProperty(
-                service, "idVendor" as CFString, kCFAllocatorDefault, 0
+                currentService, "idVendor" as CFString, kCFAllocatorDefault, 0
             ) else {
                 service = IOIteratorNext(iterator)
                 continue
@@ -192,14 +210,14 @@ final class USBDeviceDetector: ObservableObject {
 
                 // Read product ID
                 if let productProp = IORegistryEntryCreateCFProperty(
-                    service, "idProduct" as CFString, kCFAllocatorDefault, 0
+                    currentService, "idProduct" as CFString, kCFAllocatorDefault, 0
                 ) {
                     foundPID = UInt16(productProp.takeRetainedValue() as? Int ?? 0)
                 }
 
                 // Read product name
                 if let nameProp = IORegistryEntryCreateCFProperty(
-                    service, "USB Product Name" as CFString, kCFAllocatorDefault, 0
+                    currentService, "USB Product Name" as CFString, kCFAllocatorDefault, 0
                 ) {
                     foundName = nameProp.takeRetainedValue() as? String
                 }
@@ -220,10 +238,12 @@ final class USBDeviceDetector: ObservableObject {
 
         // Update state on main actor
         Task { @MainActor in
+            guard self.isMonitoring else { return }
             self.isDeviceConnected = status.isConnected
             self.connectedDeviceName = status.name
             self.connectedVendorID = status.vendorID
             self.connectedProductID = status.productID
+            self.onStatusChange?(status)
 
             if status.isConnected {
                 print("[USB] Android device found: \(status.name ?? "unknown") "

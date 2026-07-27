@@ -80,6 +80,7 @@ protocol DeviceProtocol: AnyObject {
                   cancellation: TransferCancellationToken) async throws
     /// 从 Mac 上传到手机
     func upload(from localURL: URL, to remotePath: String,
+                overwrite: Bool,
                 progress: @escaping (Double) -> Void,
                 cancellation: TransferCancellationToken) async throws
     /// 删除远程文件

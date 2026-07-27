@@ -7,6 +7,7 @@ struct PathBar: View {
     var onUp: () -> Void
     var onRefresh: () -> Void
     var onChooseDirectory: (() -> Void)?
+    var onCreateDirectory: (() -> Void)?
     
     var body: some View {
         HStack(spacing: 6) {
@@ -15,7 +16,7 @@ struct PathBar: View {
             }
             .buttonStyle(.borderless)
             .disabled(!canNavigateUp)
-            .help(canNavigateUp ? "返回上级" : "已到达授权目录根")
+            .help(canNavigateUp ? "返回上级" : "已到达根目录")
             
             Button(action: onRefresh) {
                 Image(systemName: "arrow.clockwise")
@@ -29,6 +30,14 @@ struct PathBar: View {
                 }
                 .buttonStyle(.borderless)
                 .help("选择目录")
+            }
+
+            if let onCreateDirectory {
+                Button(action: onCreateDirectory) {
+                    Image(systemName: "folder.badge.plus")
+                }
+                .buttonStyle(.borderless)
+                .help("新建文件夹")
             }
             
             Divider()

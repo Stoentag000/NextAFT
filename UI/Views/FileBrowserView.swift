@@ -16,11 +16,13 @@ struct FileBrowserView: View {
         .toolbar {
             ToolbarItemGroup(placement: .navigation) {
                 ProtocolSelector(selected: $viewModel.selectedProtocol)
-                    .disabled(viewModel.isConnected)
+                    .disabled(viewModel.isConnected || viewModel.isConnecting)
+
+                ConflictPolicySelector(selected: $viewModel.conflictPolicy)
                 
                 Button {
                     Task { 
-                        if viewModel.isConnected {
+                        if viewModel.isConnected || viewModel.isConnecting {
                             await viewModel.disconnect()
                         } else {
                             await viewModel.connect()
@@ -28,11 +30,15 @@ struct FileBrowserView: View {
                     }
                 } label: {
                     Label(
-                        viewModel.isConnected ? "断开" : "连接",
-                        systemImage: viewModel.isConnected ? "link.circle.fill" : "link.circle"
+                        viewModel.isConnected
+                            ? "断开"
+                            : (viewModel.isConnecting ? "取消连接" : "连接"),
+                        systemImage: viewModel.isConnected
+                            ? "link.circle.fill"
+                            : (viewModel.isConnecting ? "ellipsis.circle" : "link.circle")
                     )
                 }
-                .tint(viewModel.isConnected ? .red : .green)
+                .tint(viewModel.isConnected ? .red : (viewModel.isConnecting ? .orange : .green))
             }
             
             ToolbarItemGroup(placement: .primaryAction) {
@@ -49,6 +55,30 @@ struct FileBrowserView: View {
         }
         .onAppear {
             viewModel.initialize()
+        }
+        .onDisappear {
+            viewModel.shutdown()
+        }
+        .alert("删除项目", isPresented: $viewModel.showDeleteConfirmation) {
+            Button("取消", role: .cancel) {
+                viewModel.cancelDelete()
+            }
+            Button("删除", role: .destructive) {
+                viewModel.confirmDelete()
+            }
+        } message: {
+            Text(viewModel.deleteConfirmationMessage)
+        }
+        .alert("新建文件夹", isPresented: $viewModel.showCreateDirectoryPrompt) {
+            TextField("文件夹名称", text: $viewModel.newDirectoryName)
+            Button("取消", role: .cancel) {
+                viewModel.cancelCreateDirectory()
+            }
+            Button("创建") {
+                viewModel.confirmCreateDirectory()
+            }
+        } message: {
+            Text("请输入新文件夹名称。")
         }
         .alert("错误", isPresented: $viewModel.showError) {
             Button("确定") {}
@@ -71,7 +101,8 @@ struct LocalFilePanel: View {
                 canNavigateUp: viewModel.canNavigateUp,
                 onUp: { viewModel.navigateLocalUp() },
                 onRefresh: { viewModel.loadLocalFiles() },
-                onChooseDirectory: { viewModel.promptForLocalDirectory() }
+                onChooseDirectory: { viewModel.promptForLocalDirectory() },
+                onCreateDirectory: { viewModel.requestCreateDirectory(isLocal: true) }
             )
             
             Divider()
@@ -89,7 +120,8 @@ struct LocalFilePanel: View {
                         FileContextMenu(
                             file: file,
                             isLocal: true,
-                            onTransfer: { viewModel.uploadFile(file) }
+                            onTransfer: { viewModel.uploadFile(file) },
+                            onDelete: { viewModel.requestDelete(file, isLocal: true) }
                         )
                     }
                 }
@@ -127,8 +159,12 @@ struct RemoteFilePanel: View {
             // 路径导航栏
             PathBar(
                 path: viewModel.remotePath,
+                canNavigateUp: viewModel.canNavigateRemoteUp,
                 onUp: { viewModel.navigateRemoteUp() },
-                onRefresh: { Task { await viewModel.loadRemoteFiles() } }
+                onRefresh: { Task { await viewModel.loadRemoteFiles() } },
+                onCreateDirectory: viewModel.isConnected
+                    ? { viewModel.requestCreateDirectory(isLocal: false) }
+                    : nil
             )
             
             Divider()
@@ -143,11 +179,22 @@ struct RemoteFilePanel: View {
                     Text("未连接设备")
                         .font(.title2)
                     
-                    Text("请通过 USB 连接 Android 设备并选择协议")
+                    Text(viewModel.usbStatusDescription)
                         .foregroundStyle(.secondary)
+
+                    if viewModel.isConnecting {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
                     
-                    Button("连接") {
-                        Task { await viewModel.connect() }
+                    Button(viewModel.isConnecting ? "取消连接" : "连接") {
+                        Task {
+                            if viewModel.isConnecting {
+                                await viewModel.disconnect()
+                            } else {
+                                await viewModel.connect()
+                            }
+                        }
                     }
                     .buttonStyle(.borderedProminent)
                 }
@@ -164,7 +211,8 @@ struct RemoteFilePanel: View {
                         FileContextMenu(
                             file: file,
                             isLocal: false,
-                            onTransfer: { viewModel.downloadFile(file) }
+                            onTransfer: { viewModel.downloadFile(file) },
+                            onDelete: { viewModel.requestDelete(file, isLocal: false) }
                         )
                     }
                 }
